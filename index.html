@@ -160,6 +160,7 @@ button.empty.go { width: 100%; justify-content: center; border: 3px dashed rgba(
 .passl small { font-size: 13px; color: var(--dim); white-space: nowrap; }
 .btn.ok { background: var(--lettuce); color: var(--edge); box-shadow: inset 0 -3px 0 #3c8f46, inset 0 3px 0 rgba(255,255,255,.4); }
 .netl.center { justify-content: center; }
+.srv { margin-left: 6px; padding: 2px 8px; border: 2px solid var(--line); background: var(--edge); color: var(--dim); font-size: 12px; cursor: pointer; }
 .pats { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding-top: 6px; border-top: 3px dashed rgba(18,12,31,.35); }
 .pats > img:first-child { display: none; }
 .crew { display: grid; gap: 6px; }
@@ -1935,13 +1936,12 @@ function localRoom() {
 async function connect() {
   const c = window.claude;
   if (!c || typeof c.use !== 'function') {
-    // outside Claude (GitHub Pages etc.): play together by connecting phones directly
-    net.p2p = true; net.lobby = p2pLobby; net.realDb = p2pDb; net.user = null; net.canWrite = true;
+    // outside Claude (GitHub Pages etc.): play together through a public relay server
+    net.p2p = true; net.lobby = relayLobby; net.realDb = relayDb; net.user = null; net.canWrite = true;
     net.room = localRoom(); net.db = localDb();
     let p = store.get('kb_pid', '');
     if (!p) { p = 'p' + rid(); store.set('kb_pid', p); }
     net.uid = p;
-    loadPeerLib().catch(() => { });
     return;
   }
   const get = async n => { if (!c || typeof c.use !== 'function') return null; try { return await c.use(n); } catch (e) { return null; } };
@@ -2060,9 +2060,11 @@ function loseHost(noFlush) {
   net.room.presence({ rs: null, sk: null }).catch(() => { });
   setPresence(); invalidate();
 }
-function otherShopkeeper() { return net.room.peers().some(p => !p.isMe && p.kind === 'viewer' && p.presence && p.presence.role === 'shop' && p.presence.n); }
+function otherShopkeeper() { return net.room.peers().some(p => !p.isMe && p.kind === 'viewer' && p.presence && p.presence.role === 'shop' && p.presence.n && p.presence.sc && p.presence.sc !== 'lobby'); }
 async function hostTick() {
   if (!net.snapReady || !app.started) return;
+  // right after a lobby start, let everyone's "started" arrive first so the right phone runs the clock
+  if (app.mode === 'multi' && Date.now() - (app.startedAt || 0) < 2500) return;
   const ses = net.ses;
   const solo = app.mode === 'solo';
   const want = (solo || net.canWrite !== false) && (solo || app.role === 'shop' || !otherShopkeeper());
@@ -2140,7 +2142,7 @@ function hostPeer() { return net.room.peers().find(p => p.presence && p.presence
 function pumpRS(now) {
   if (isHost && S) {
     if (S.phase === 'night' && S.R) {
-      if (now - rsSent > 110) { rsSent = now; rsLive = true; net.room.presence({ rs: packRS() }).catch(() => { }); }
+      if (now - rsSent > (net.p2p ? 180 : 110)) { rsSent = now; rsLive = true; net.room.presence({ rs: packRS() }).catch(() => { }); }
     } else if (rsLive) { rsLive = false; net.room.presence({ rs: null }).catch(() => { }); }
     return;
   }
@@ -2198,271 +2200,230 @@ function bindRoom() {
 }
 function sendChat(i) { net.room.emit('chat', { m: i, n: app.name, r: app.role }).catch(() => { }); }
 
-/* ===== 08 peer-to-peer backend: used when the page runs outside Claude (GitHub Pages etc.) =====
-   A star over WebRTC (PeerJS). The first phone to claim the passphrase's hub id relays room traffic
-   and holds the authoritative copy of the session docs. Every phone keeps a replica (also saved on
-   the device), so when the hub drops another phone claims a hub slot and play carries on. */
-const P2P_LIB = 'https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js';
-const HUB_SLOTS = 4;
-let peerLibP = null;
-function loadPeerLib() {
-  if (window.Peer) return Promise.resolve(window.Peer);
-  if (peerLibP) return peerLibP;
-  peerLibP = new Promise((res, rej) => {
-    const s = document.createElement('script');
-    s.src = window.__KB_PEERJS_URL || P2P_LIB; s.async = true;
-    s.onload = () => (window.Peer ? res(window.Peer) : rej(new Error('nolib')));
-    s.onerror = () => { peerLibP = null; rej(new Error('load')); };
-    document.head.append(s);
-  });
-  return peerLibP;
-}
-const peerOpts = () => Object.assign({ debug: 0 }, window.__KB_PEER || {});
+/* ===== 08 relay backend: used when the page runs outside Claude (GitHub Pages etc.) =====
+   Every phone talks to a free public MQTT server over a secure WebSocket; the server passes
+   messages on to everyone with the same passphrase. No direct phone-to-phone link is needed,
+   so carrier networks that block those links are fine. There is no central copy of the save:
+   every phone keeps one (also on the device) and the newest wins when people meet.
+   The phone that runs the shop clock is chosen from presence the same way on every phone. */
+const BROKERS = [
+  { id: 'A', url: 'wss://broker.emqx.io:8084/mqtt' },
+  { id: 'B', url: 'wss://broker.hivemq.com:8884/mqtt' },
+  { id: 'C', url: 'wss://test.mosquitto.org:8081/mqtt' }
+];
+const brokers = () => window.__KB_BROKERS || BROKERS;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const p2pErr = code => { const e = new Error(code); e.code = code; return e; };
+const relayErr = code => { const e = new Error(code); e.code = code; return e; };
 
-function p2pSession(code) {
-  const me = net.tab, base = 'knnny-' + code.replace(/^kb-/, '') + '-';
-  const hubId = k => base + k;
+/* ---- a small MQTT 3.1.1 client (QoS 0) over WebSocket ---- */
+const u8enc = new TextEncoder(), u8dec = new TextDecoder();
+function mStr(s) { const b = u8enc.encode(s); const o = new Uint8Array(b.length + 2); o[0] = b.length >> 8; o[1] = b.length & 255; o.set(b, 2); return o; }
+function mPkt(head, parts) {
+  const chunks = parts.map(p => (p instanceof Uint8Array ? p : Uint8Array.from(p)));
+  let n = chunks.reduce((a, c) => a + c.length, 0);
+  const L = []; do { let d = n % 128; n = Math.floor(n / 128); if (n > 0) d |= 128; L.push(d); } while (n > 0);
+  const total = chunks.reduce((a, c) => a + c.length, 0), out = new Uint8Array(1 + L.length + total);
+  out[0] = head; out.set(L, 1); let o = 1 + L.length;
+  for (const c of chunks) { out.set(c, o); o += c.length; }
+  return out;
+}
+function mqttClient(url, o) {
+  let ws;
+  try { ws = new WebSocket(url, ['mqtt']); } catch (e) { setTimeout(() => o.onClose && o.onClose(), 0); return { publish() { }, subscribe() { }, end() { } }; }
+  ws.binaryType = 'arraybuffer';
+  let buf = new Uint8Array(0), pid = 1, lastRx = Date.now(), done = false;
+  const ka = o.keepalive || 20;
+  const send = p => { try { if (ws.readyState === 1) ws.send(p); } catch (e) { } };
+  const fin = () => { if (done) return; done = true; clearInterval(tm); try { ws.close(); } catch (e) { } o.onClose && o.onClose(); };
+  const tm = setInterval(() => {
+    if (ws.readyState !== 1) return;
+    if (Date.now() - lastRx > ka * 1500) { fin(); return; }
+    send(Uint8Array.of(0xC0, 0));
+  }, ka * 500);
+  ws.onopen = () => {
+    const w = o.will;
+    const flags = 0x02 | (w ? 0x04 | (w.retain ? 0x20 : 0) : 0);
+    const parts = [mStr('MQTT'), [4, flags, ka >> 8, ka & 255], mStr(o.clientId)];
+    if (w) { const wp = u8enc.encode(w.payload); parts.push(mStr(w.topic), [wp.length >> 8, wp.length & 255], wp); }
+    send(mPkt(0x10, parts));
+  };
+  ws.onmessage = e => {
+    lastRx = Date.now();
+    const d = new Uint8Array(e.data), nb = new Uint8Array(buf.length + d.length);
+    nb.set(buf); nb.set(d, buf.length); buf = nb;
+    while (buf.length >= 2) {
+      let mult = 1, len = 0, i = 1, b;
+      do { if (i >= buf.length) return; b = buf[i++]; len += (b & 127) * mult; mult *= 128; } while (b & 128);
+      if (buf.length < i + len) return;
+      const type = buf[0] >> 4, flags = buf[0] & 15, body = buf.subarray(i, i + len);
+      buf = buf.slice(i + len);
+      if (type === 2) { if (body[1] === 0) o.onOpen && o.onOpen(); else fin(); }
+      else if (type === 3) {
+        const tl = (body[0] << 8) | body[1], topic = u8dec.decode(body.subarray(2, 2 + tl));
+        let off = 2 + tl; if ((flags >> 1) & 3) off += 2;
+        try { o.onMsg && o.onMsg(topic, u8dec.decode(body.subarray(off))); } catch (err) { }
+      } else if (type === 9) { o.onSub && o.onSub(); }
+    }
+  };
+  ws.onclose = fin; ws.onerror = fin;
+  return {
+    subscribe(filter) { const id = pid++; send(mPkt(0x82, [[id >> 8, id & 255], mStr(filter), [0]])); },
+    publish(topic, str) { send(mPkt(0x30, [mStr(topic), u8enc.encode(str)])); },
+    end() { send(Uint8Array.of(0xE0, 0)); setTimeout(fin, 50); },
+    isOpen: () => ws.readyState === 1 && !done
+  };
+}
+
+/* ---- one passphrase session ---- */
+function relaySession(code, startIdx) {
+  const me = net.tab, pre = 'knnny/v1/' + code.replace(/^kb-/, '') + '/';
   const LSK = 'kb_p2p_' + code;
   const X = {
-    docs: new Map(), dsubs: new Set(), pres: {}, myPres: {}, msgH: {}, peerH: [], connH: [],
-    hub: false, slot: -1, peer: null, conn: null, clients: new Map(), leases: new Map(),
-    closed: false, open: false, finding: false, checkN: 0, lastHub: 0, pending: new Map(), cache: null, saveT: 0, timers: [], tickAt: Date.now()
+    docs: new Map(), dsubs: new Set(), pres: {}, seen: {}, myPres: {}, msgH: {}, peerH: [], connH: [],
+    open: false, closed: false, cli: null, idx: startIdx || 0, everOpen: false, tries: 0,
+    pend: null, pubAt: 0, pubT: 0, saveT: 0, timers: [], cache: null, hbAt: 0
   };
   const keepDoc = p => !p.includes('/in/') && !p.endsWith('/host');
-  const dbg = (...a) => { if (window.__KB_TEST) (window.__p2plog = window.__p2plog || []).push((Date.now() % 100000) + ' ' + a.join(' ')); };
   try { const o = JSON.parse(store.get(LSK, '{}')); for (const p in o) X.docs.set(p, o[p]); } catch (e) { }
   function saveNow() { if (X.saveT) { clearTimeout(X.saveT); X.saveT = 0; } const o = {}; X.docs.forEach((x, p) => { if (keepDoc(p)) o[p] = x; }); store.set(LSK, JSON.stringify(o)); }
-  function scheduleSave() { if (!X.saveT) X.saveT = setTimeout(saveNow, 1500); }
-  const onHide = e => { if (document.hidden || e.type === "pagehide") saveNow(); };
+  const scheduleSave = () => { if (!X.saveT) X.saveT = setTimeout(saveNow, 1500); };
+  const onHide = e => { if (document.hidden || e.type === 'pagehide') saveNow(); };
   addEventListener('pagehide', onHide); document.addEventListener('visibilitychange', onHide);
   function applyDoc(path, d, ts) {
     if (d == null) X.docs.delete(path); else X.docs.set(path, { d, ts: ts || Date.now() });
     scheduleSave();
     X.dsubs.forEach(f => { try { f(path); } catch (e) { } });
   }
-  const docList = filter => [...X.docs].filter(([p]) => !filter || keepDoc(p)).map(([p, x]) => [p, x.d, x.ts]);
+  const docList = () => [...X.docs].filter(([p]) => keepDoc(p)).map(([p, x]) => [p, x.d, x.ts]);
 
-  /* ---- presence + messages ---- */
+  /* presence + messages */
   function firePeers() { X.cache = null; X.peerH.slice().forEach(f => { try { f({ peers: room.peers(), joined: [], left: [], updated: [] }); } catch (e) { } }); }
-  function setPres(name, patch) {
-    const p = X.pres[name] || (X.pres[name] = {});
-    for (const k in patch || {}) { if (patch[k] === null) delete p[k]; else p[k] = patch[k]; }
-    firePeers();
-  }
   function deliver(from, topic, data) {
     (X.msgH[topic] || []).slice().forEach(f => { try { f({ peer: from, by: from, kind: 'viewer', guest: false, isMe: from === me, sameTab: from === me, topic, data }); } catch (e) { } });
   }
   function setOpen(v) { if (X.open === v) return; X.open = v; X.connH.slice().forEach(f => { try { f(v); } catch (e) { } }); }
-  const sendC = (c, m) => { try { if (c.conn.open) c.conn.send(m); } catch (e) { } };
-  const bcast = (m, except) => X.clients.forEach(c => { if (c !== except) sendC(c, m); });
-  const toHub = m => { try { if (X.conn && X.conn.open) { X.conn.send(m); return true; } } catch (e) { } return false; };
+  const pub = (kind, obj) => {
+    if (!X.cli || !X.open) return;
+    const str = JSON.stringify(obj);
+    if (window.__KB_TEST) { const st = window.__relayStats || (window.__relayStats = {}); const k = kind + (obj.pt ? ':' + Object.keys(obj.pt).join(',') : obj.t ? ':' + obj.t : ''); st[k] = st[k] || [0, 0]; st[k][0]++; st[k][1] += str.length; }
+    X.cli.publish(pre + kind, str);
+  };
+  const pubFull = () => { X.hbAt = Date.now(); pub('p', { f: me, p: X.myPres }); };
+  function flushPres() {
+    X.pubT = 0;
+    if (!X.pend) return;
+    const pt = X.pend; X.pend = null; X.pubAt = Date.now();
+    pub('p', { f: me, pt });
+  }
+  const syncDocs = () => { const docs = docList(); if (docs.length) pub('d', { f: me, sync: 1, docs }); };
 
-  /* ---- hub side ---- */
-  const leaseActive = () => { const now = Date.now(); for (const l of X.leases.values()) if (l.exp > now) return true; return false; };
-  function hubAcquire(path, holder, ttl) {
-    const l = X.leases.get(path), now = Date.now();
-    if (!l || l.exp < now || l.holder === holder) { X.leases.set(path, { holder, exp: now + clamp(+ttl || 30000, 1000, 600000) }); return { acquired: true }; }
-    return { acquired: false };
-  }
-  function dropClient(c) {
-    if (!c.name || X.clients.get(c.name) !== c) return;
-    X.clients.delete(c.name); delete X.pres[c.name]; firePeers();
-    bcast({ t: 'p', peer: c.name, gone: 1 });
-  }
-  function hubAccept(conn) {
-    const c = { conn, name: null, last: Date.now() };
-    conn.on('data', m => { if (!m || typeof m !== 'object') return; c.last = Date.now(); onHubData(c, m); });
-    conn.on('close', () => dropClient(c));
-    conn.on('error', () => dropClient(c));
-  }
-  function onHubData(c, m) {
-    if (m.t === 'hello') {
-      c.name = String(m.me || '').slice(0, 40) || rid();
-      const old = X.clients.get(c.name); if (old && old !== c) { try { old.conn.close(); } catch (e) { } }
-      X.clients.set(c.name, c);
-      // a joiner may bring a newer save; take it only while nobody is playing
-      if (!leaseActive()) for (const [p, d, ts] of m.docs || []) {
-        if (!keepDoc(p)) continue;
-        const cur = X.docs.get(p);
-        if (!cur || ts > cur.ts + 1000) { applyDoc(p, d, ts); bcast({ t: 'd', path: p, d, ts }, c); }
-      }
-      setPres(c.name, m.pres || {}); bcast({ t: 'p', peer: c.name, p: m.pres || {} }, c);
-      sendC(c, { t: 'welcome', docs: docList(false), pres: X.pres });
-      return;
-    }
-    if (!c.name) return;
-    if (m.t === 'w') { applyDoc(m.path, m.d, m.ts); bcast({ t: 'd', path: m.path, d: m.d, ts: m.ts }, c); }
-    else if (m.t === 'p') { setPres(c.name, m.p); bcast({ t: 'p', peer: c.name, p: m.p }, c); }
-    else if (m.t === 'm') { deliver(c.name, m.topic, m.data); bcast({ t: 'm', from: c.name, topic: m.topic, data: m.data }, c); }
-    else if (m.t === 'a') sendC(c, { t: 'r', rid: m.rid, r: hubAcquire(m.path, m.holder, m.ttl) });
-    else if (m.t === 'hb') sendC(c, { t: 'hb' });
-  }
-
-  /* ---- client side ---- */
-  function onClientData(m) {
-    if (!m || typeof m !== 'object') return;
-    X.lastHub = Date.now();
-    if (m.t === 'welcome') {
-      const keep = new Set();
-      for (const [p, d, ts] of m.docs || []) { keep.add(p); const cur = X.docs.get(p); if (!cur || cur.ts !== ts) applyDoc(p, d, ts); }
-      for (const p of [...X.docs.keys()]) if (!keep.has(p)) applyDoc(p, null);
-      X.pres = Object.assign({}, m.pres || {}); X.pres[me] = X.myPres; firePeers();
-      setOpen(true);
-    } else if (m.t === 'd') applyDoc(m.path, m.d, m.ts);
-    else if (m.t === 'p') { if (m.gone) { delete X.pres[m.peer]; firePeers(); } else if (m.peer !== me) setPres(m.peer, m.p); }
-    else if (m.t === 'm') deliver(m.from, m.topic, m.data);
-    else if (m.t === 'r') { const q = X.pending.get(m.rid); if (q) { X.pending.delete(m.rid); clearTimeout(q.tm); q.res(m.r); } }
-  }
-  function onHubLost() {
-    if (X.closed || X.hub) return;
-    dbg('hub lost');
-    X.conn = null; setOpen(false);
-    X.pending.forEach(q => { clearTimeout(q.tm); q.rej(p2pErr('upstream_error')); }); X.pending.clear();
-    for (const k of Object.keys(X.pres)) if (k !== me) delete X.pres[k];
-    firePeers();
-    findHub();
-  }
-
-  /* ---- finding or becoming the hub ---- */
-  function destroyPeer() { const p = X.peer; X.peer = null; X.conn = null; if (p) try { p.destroy(); } catch (e) { } }
-  let cpP = null;
-  function clientPeer() {
-    if (X.peer && !X.hub && !X.peer.destroyed && X.peer.open) return Promise.resolve(X.peer);
-    if (cpP) return cpP;
-    destroyPeer(); X.hub = false;
-    cpP = loadPeerLib().then(Peer => new Promise((res, rej) => {
-      const p = new Peer(peerOpts()); X.peer = p;
-      const tm = setTimeout(() => rej(p2pErr('upstream_error')), 10000);
-      p.on('open', () => { clearTimeout(tm); res(p); });
-      p.on('error', e => { if (!p.open) { clearTimeout(tm); rej(p2pErr('upstream_error')); } else onPeerErr(e); });
-      p.on('disconnected', () => { if (!X.closed && X.peer === p) try { p.reconnect(); } catch (e) { } });
-    }));
-    cpP.then(() => { cpP = null; }, () => { cpP = null; });
-    return cpP;
-  }
-  const unavailable = new Set();
-  function onPeerErr(e) { dbg('peer err', e && e.type, e && e.message); if (e && e.type === 'peer-unavailable') { const m = /\S+$/.exec(String(e.message || '')); if (m) unavailable.add(m[0]); } }
-  function connectTo(k, wait) {
-    return clientPeer().then(p => new Promise(res => {
-      const id = hubId(k); unavailable.delete(id);
-      let done = false;
-      const conn = p.connect(id, { reliable: true });
-      const fin = ok => { if (done) return; done = true; clearInterval(iv); clearTimeout(tm); if (!ok) { try { conn.close(); } catch (e) { } } res(ok ? conn : null); };
-      const iv = setInterval(() => { if (unavailable.has(id)) fin(false); }, 150);
-      const tm = setTimeout(() => fin(false), wait);
-      conn.on('open', () => fin(true));
-      conn.on('error', () => fin(false));
-    })).catch(() => null);
-  }
-  function adoptConn(conn, k) {
-    X.conn = conn; X.hub = false; X.slot = k; X.lastHub = Date.now();
-    conn.on('data', onClientData);
-    conn.on('close', () => { if (X.conn === conn) onHubLost(); });
-    conn.on('error', () => { if (X.conn === conn) onHubLost(); });
-    conn.send({ t: 'hello', me, pres: X.myPres, docs: docList(true) });
-  }
-  function claim(k) {
-    destroyPeer();
-    return loadPeerLib().then(Peer => new Promise(res => {
-      const p = new Peer(hubId(k), peerOpts());
-      const tm = setTimeout(() => { try { p.destroy(); } catch (e) { } res('err'); }, 10000);
-      p.on('open', () => {
-        clearTimeout(tm);
-        if (X.closed) { try { p.destroy(); } catch (e) { } res('err'); return; }
-        X.peer = p; X.hub = true; X.slot = k; X.leases.clear(); X.clients.clear();
-        p.on('connection', hubAccept);
-        p.on('disconnected', () => { if (!X.closed && X.peer === p) try { p.reconnect(); } catch (e) { } });
-        for (const key of Object.keys(X.pres)) if (key !== me) delete X.pres[key];
-        X.pres[me] = X.myPres; firePeers(); setOpen(true);
-        res('ok');
-      });
-      p.on('error', e => { if (p.open) return; clearTimeout(tm); try { p.destroy(); } catch (x) { } res(e && e.type === 'unavailable-id' ? 'taken' : 'err'); });
-    })).catch(() => 'err');
-  }
-  async function probe() {
-    const ks = Array.from({ length: HUB_SLOTS }, (_, k) => k);
-    const conns = await Promise.all(ks.map(k => connectTo(k, 3000)));
-    const k = conns.findIndex(Boolean);
-    dbg('probe', conns.map(Boolean).join(','));
-    conns.forEach((c, i) => { if (c && i !== k) try { c.close(); } catch (e) { } });
-    if (k >= 0) { adoptConn(conns[k], k); return true; }
-    return false;
-  }
-  async function findHub() {
-    if (X.closed || X.finding) return;
-    X.finding = true;
-    try {
-      for (let round = 0; !X.closed; round++) {
-        if (await probe()) return;
-        for (let k = 0; k < HUB_SLOTS && !X.closed; k++) {
-          const r = await claim(k);
-          dbg('claim', k, r);
-          if (r === 'ok') return;
-          if (r === 'taken') { const c = await connectTo(k, 4000); if (c) { adoptConn(c, k); return; } }
-        }
-        await sleep(1500 + Math.random() * 2500);
-      }
-    } finally { X.finding = false; }
-  }
-  /* a hub on a higher slot steps down when a lower slot is alive, so the group ends up on one hub */
-  function lowerAlive() {
-    const p = X.peer; if (!p || !X.hub) return;
-    for (let j = 0; j < X.slot; j++) {
-      let conn; try { conn = p.connect(hubId(j), { reliable: true }); } catch (e) { continue; }
-      const tm = setTimeout(() => { try { conn.close(); } catch (e) { } }, 4000);
-      conn.on('open', () => {
-        clearTimeout(tm); try { conn.close(); } catch (e) { }
-        if (X.closed || !X.hub || X.peer !== p) return;
-        X.clients.forEach(c => { try { c.conn.close(); } catch (e) { } }); X.clients.clear();
-        destroyPeer(); X.hub = false; setOpen(false); findHub();
-      });
+  function onMsg(topic, payload) {
+    let j; try { j = JSON.parse(payload); } catch (e) { return; }
+    if (!j || typeof j !== 'object' || !j.f || j.f === me) return;
+    const kind = topic.slice(pre.length), from = String(j.f).slice(0, 40);
+    if (kind === 'p') {
+      if (j.gone) { if (X.pres[from]) { delete X.pres[from]; delete X.seen[from]; firePeers(); } return; }
+      if (j.p && typeof j.p === 'object') X.pres[from] = j.p;
+      else if (j.pt && typeof j.pt === 'object') { const p = X.pres[from] || (X.pres[from] = {}); for (const k in j.pt) { if (j.pt[k] === null) delete p[k]; else p[k] = j.pt[k]; } }
+      else return;
+      X.seen[from] = Date.now(); firePeers();
+    } else if (kind === 'm') {
+      if (j.t === '__hello') { setTimeout(pubFull, Math.random() * 300); setTimeout(syncDocs, 300 + Math.random() * 600); return; }
+      deliver(from, String(j.t || ''), j.d === undefined ? null : j.d);
+    } else if (kind === 'd') {
+      if (j.sync && Array.isArray(j.docs)) {
+        for (const x of j.docs) { if (!Array.isArray(x) || !keepDoc(String(x[0]))) continue; const cur = X.docs.get(x[0]); if (!cur || x[2] > cur.ts) applyDoc(x[0], x[1], x[2]); }
+      } else if (j.path) applyDoc(String(j.path), j.d === undefined ? null : j.d, j.ts);
     }
   }
-  /* heartbeats, dead-hub detection, and a hub that was asleep stepping down */
+  function connect() {
+    if (X.closed) return;
+    const list = brokers(), b = list[X.idx % list.length];
+    let opened = false;
+    const cli = mqttClient(b.url, {
+      clientId: 'kb' + rid() + rid().slice(0, 6), keepalive: 20,
+      will: { topic: pre + 'p', payload: JSON.stringify({ f: me, gone: 1 }) },
+      onOpen: () => { if (X.cli === cli) cli.subscribe(pre + '#'); },
+      onSub: () => {
+        if (X.cli !== cli || opened) return;
+        opened = true; X.everOpen = true; X.tries = 0; setOpen(true);
+        pubFull(); pub('m', { f: me, t: '__hello' }); setTimeout(syncDocs, 400);
+      },
+      onMsg,
+      onClose: () => {
+        if (X.cli !== cli) return;
+        X.cli = null; setOpen(false);
+        for (const k of Object.keys(X.pres)) if (k !== me) delete X.pres[k];
+        firePeers();
+        if (X.closed) return;
+        X.tries++;
+        // never reached this server: try the next one; a dropped connection: come back to the same one
+        if (!opened && !X.everOpen) X.idx++;
+        setTimeout(connect, Math.min(8000, 600 * X.tries));
+      }
+    });
+    X.cli = cli;
+    // a server that never answers
+    setTimeout(() => { if (X.cli === cli && !opened && !X.closed) cli.end(); }, 7000);
+  }
   X.timers.push(setInterval(() => {
     if (X.closed) return;
-    const now = Date.now(), gap = now - X.tickAt; X.tickAt = now;
-    if (X.hub) {
-      if (gap > 6000 && X.clients.size === 0 && !X.finding) { destroyPeer(); X.hub = false; setOpen(false); findHub(); return; }
-      if (X.slot > 0 && ++X.checkN % 10 === 0) lowerAlive();
-      X.clients.forEach(c => { if (now - c.last > 10000) { try { c.conn.close(); } catch (e) { } dropClient(c); } else sendC(c, { t: 'hb' }); });
-    } else if (X.conn) {
-      toHub({ t: 'hb' });
-      if (now - X.lastHub > 5000) { const c = X.conn; X.conn = null; try { c.close(); } catch (e) { } onHubLost(); }
-    }
+    const now = Date.now();
+    if (X.open && now - X.hbAt > 4000) pubFull();
+    let ch = false;
+    for (const k of Object.keys(X.pres)) if (k !== me && now - (X.seen[k] || 0) > 13000) { delete X.pres[k]; delete X.seen[k]; ch = true; }
+    if (ch) firePeers();
   }, 1000));
 
-  /* ---- the room and db the game talks to (same shapes as Claude's) ---- */
+  /* the shop clock runs on one phone, chosen from presence the same way everywhere:
+     a shopkeeper if any is playing, the one already running it if possible, else the earliest arrival */
+  function electHost() {
+    const c = Object.keys(X.pres).map(k => ({ k, p: X.pres[k] })).filter(x => x.p && x.p.sc && x.p.sc !== 'lobby');
+    if (!c.length) return null;
+    // whoever already runs it keeps it (a handover happens when they step down), so two phones never run it at once
+    const cur = c.filter(x => x.p.host === 1).sort((a, b) => (a.k < b.k ? -1 : 1))[0];
+    if (cur) return cur.k;
+    const pool = c.some(x => x.p.role === 'shop') ? c.filter(x => x.p.role === 'shop') : c;
+    return pool.sort((a, b) => ((a.p.jt || 0) - (b.p.jt || 0)) || (a.k < b.k ? -1 : 1))[0].k;
+  }
+
   const room = {
     name: code,
     emit: async (topic, data) => {
       data = data === undefined ? null : JSON.parse(JSON.stringify(data));
       deliver(me, topic, data);
-      if (X.hub) bcast({ t: 'm', from: me, topic, data }); else toHub({ t: 'm', topic, data });
+      pub('m', { f: me, t: topic, d: data });
     },
     on: (t, f) => { (X.msgH[t] = X.msgH[t] || []).push(f); return () => { X.msgH[t] = (X.msgH[t] || []).filter(x => x !== f); }; },
     presence: async patch => {
       patch = JSON.parse(JSON.stringify(patch || {}));
       for (const k in patch) { if (patch[k] === null) delete X.myPres[k]; else X.myPres[k] = patch[k]; }
       X.pres[me] = X.myPres; firePeers();
-      if (X.hub) bcast({ t: 'p', peer: me, p: patch }); else toHub({ t: 'p', p: patch });
+      X.pend = Object.assign(X.pend || {}, patch);
+      if (!X.pubT) X.pubT = setTimeout(flushPres, Math.max(0, 150 - (Date.now() - X.pubAt)));
     },
     peers: () => X.cache || (X.cache = Object.keys(X.pres).map(k => Object.freeze({ peer: k, by: k, kind: 'viewer', guest: false, isMe: k === me, sameTab: k === me, presence: X.pres[k], updatedAt: 0 }))),
     onPeers: f => { X.peerH.push(f); queueMicrotask(() => { try { f({ peers: room.peers(), joined: room.peers(), left: [], updated: [] }); } catch (e) { } }); return () => { const i = X.peerH.indexOf(f); if (i >= 0) X.peerH.splice(i, 1); }; },
     connected: () => X.open,
     onConnection: f => { X.connH.push(f); queueMicrotask(() => f(X.open)); return () => { const i = X.connH.indexOf(f); if (i >= 0) X.connH.splice(i, 1); }; },
     leave: async () => close(),
-    isHub: () => X.hub
+    server: () => (brokers()[X.idx % brokers().length] || {}).id || '?',
+    switchServer: () => {
+      X.idx++; X.everOpen = false; X.tries = 0;
+      const c = X.cli; X.cli = null; setOpen(false);
+      for (const k of Object.keys(X.pres)) if (k !== me) delete X.pres[k];
+      firePeers();
+      if (c) { try { c.publish(pre + 'p', JSON.stringify({ f: me, gone: 1 })); } catch (e) { } c.end(); }
+      connect();
+    }
   };
   function write(path, d) {
     const ts = Date.now();
     d = d == null ? null : JSON.parse(JSON.stringify(d));
     applyDoc(path, d, ts);
-    if (X.hub) bcast({ t: 'd', path, d, ts }); else toHub({ t: 'w', path, d, ts });
+    pub('d', { f: me, path, d, ts });
   }
-  const snap = (id, path) => { const x = X.docs.get(path); return { id, exists: !!x, data: () => (x ? JSON.parse(JSON.stringify(x.d)) : undefined), metadata: { fromCache: !X.open, hasPendingWrites: false } }; };
+  const snap = (id, path) => { const x = X.docs.get(path); return { id, exists: !!x, data: () => (x ? JSON.parse(JSON.stringify(x.d)) : undefined), metadata: { fromCache: false, hasPendingWrites: false } }; };
   function docRef(path) {
     const id = path.split('/').pop();
     return {
@@ -2471,15 +2432,7 @@ function p2pSession(code) {
       set: async d => write(path, d),
       update: async d => write(path, Object.assign({}, (X.docs.get(path) || {}).d || {}, d)),
       delete: async () => write(path, null),
-      acquire: o => {
-        if (X.hub) return Promise.resolve(hubAcquire(path, o.holder, o.ttlMs));
-        if (!X.conn || !X.open) return Promise.reject(p2pErr('upstream_error'));
-        return new Promise((res, rej) => {
-          const r = rid(), tm = setTimeout(() => { X.pending.delete(r); rej(p2pErr('upstream_error')); }, 5000);
-          X.pending.set(r, { res, rej, tm });
-          toHub({ t: 'a', rid: r, path, holder: o.holder, ttl: o.ttlMs });
-        });
-      },
+      acquire: o => X.open ? Promise.resolve({ acquired: electHost() === o.holder }) : Promise.reject(relayErr('upstream_error')),
       onSnapshot(next) {
         let last = {};
         const fire = p => { if (p && p !== path) return; const x = X.docs.get(path); if (x === last) return; last = x; next(snap(id, path)); };
@@ -2512,33 +2465,35 @@ function p2pSession(code) {
   function close() {
     if (X.closed) return;
     X.closed = true; X.timers.forEach(clearInterval);
+    if (X.pubT) { clearTimeout(X.pubT); X.pubT = 0; }
     saveNow(); removeEventListener('pagehide', onHide); document.removeEventListener('visibilitychange', onHide);
-    X.pending.forEach(q => { clearTimeout(q.tm); q.rej(p2pErr('upstream_error')); }); X.pending.clear();
-    destroyPeer(); X.dsubs.clear(); X.msgH = {}; X.peerH = []; X.connH = [];
-    if (P2P.cur === S2) P2P.cur = null;
+    const c = X.cli; X.cli = null;
+    if (c) { try { c.publish(pre + 'p', JSON.stringify({ f: me, gone: 1 })); } catch (e) { } c.end(); }
+    X.dsubs.clear(); X.msgH = {}; X.peerH = []; X.connH = [];
+    if (RELAY.cur === S2) RELAY.cur = null;
   }
   const S2 = { room, db: { doc: docRef, collection: colRef }, close, X };
-  return { S2, start: findHub };
+  X.pres[me] = X.myPres;
+  return { S2, start: connect };
 }
 
 /* the lobby/db pair the network layer uses when there is no Claude runtime */
-const P2P = { cur: null };
+const RELAY = { cur: null };
 const emptyDb = localDb();
-const p2pDb = {
-  doc: p => (P2P.cur ? P2P.cur.db.doc(p) : emptyDb.doc(p)),
-  collection: p => (P2P.cur ? P2P.cur.db.collection(p) : emptyDb.collection(p))
+const relayDb = {
+  doc: p => (RELAY.cur ? RELAY.cur.db.doc(p) : emptyDb.doc(p)),
+  collection: p => (RELAY.cur ? RELAY.cur.db.collection(p) : emptyDb.collection(p))
 };
-const p2pLobby = {
+const relayLobby = {
   async join(code) {
-    if (P2P.cur) { P2P.cur.close(); P2P.cur = null; }
-    try { await loadPeerLib(); } catch (e) { throw p2pErr('upstream_error'); }
-    const { S2, start } = p2pSession(code);
-    P2P.cur = S2;
+    if (RELAY.cur) { RELAY.cur.close(); RELAY.cur = null; }
+    const { S2, start } = relaySession(code, 0);
+    RELAY.cur = S2;
     start();
     const t0 = Date.now();
     while (!S2.X.open) {
-      if (S2.X.closed) throw p2pErr('upstream_error');
-      if (Date.now() - t0 > 25000) { S2.close(); throw p2pErr('upstream_error'); }
+      if (S2.X.closed) throw relayErr('upstream_error');
+      if (Date.now() - t0 > 25000) { S2.close(); throw relayErr('upstream_error'); }
       await sleep(150);
     }
     return S2.room;
@@ -4052,7 +4007,7 @@ function renderLobby() {
   const waiting = ps.filter(p => lbIn(p) && !(lead && p.peer === lead.peer));
   const ready = waiting.filter(p => p.presence.rdy).length;
   const v = V;
-  const sig = JSON.stringify([ps.map(p => [p.peer, p.isMe, p.presence.n, p.presence.role, p.presence.sc, p.presence.rdy]), lead && lead.peer, LB.rdy, app.role, v && [v.day, v.phase, Math.floor(v.money / 1e4), v.over]]);
+  const sig = JSON.stringify([ps.map(p => [p.peer, p.isMe, p.presence.n, p.presence.role, p.presence.sc, p.presence.rdy]), lead && lead.peer, LB.rdy, app.role, v && [v.day, v.phase, Math.floor(v.money / 1e4), v.over], net.room.server && net.room.server(), net.room.connected()]);
   if (sig === LB.sig && $('#lobby')) return;
   LB.sig = sig;
   const shop = v ? (v.over ? '前のゲームは終わっています' : v.day + '日目のお店 ・ ' + fmtY(v.money)) : '新しいお店';
@@ -4088,7 +4043,8 @@ function renderLobby() {
     h('div', { class: 'rcards' }, cards),
     act,
     h('p', { class: 'netl center' }, note),
-    net.p2p ? h('p', { class: 'netl center' }, px('i_lock', 2), 'セーブは参加したみんなのスマホに残ります') : null
+    net.p2p ? h('div', { class: 'netl center' }, px('i_lock', 2), 'セーブはみんなのスマホに残ります',
+      net.room.server ? h('button', { class: 'srv', type: 'button', onclick: () => { net.room.switchServer(); LB.sig = ''; toast('サーバーを切り替えました'); setTimeout(() => { LB.sig = ''; renderLobby(); }, 300); } }, 'サーバー' + net.room.server()) : null) : null
   ], { dismiss: false });
 }
 /* enter the game (solo, after the lobby, or joining a shop already open) */
@@ -4096,7 +4052,8 @@ function startGame(mode) {
   LB.on = false;
   PW.key = ''; PW.gen = ''; app.resShown = 0; app.overShown = ''; debtFaceIdx = -1; popOpen = false;
   app.tab = mode === 'multi' && app.role === 'shop' ? 'prep' : 'go';
-  app.started = true; closeSheet();
+  app.started = true; app.startedAt = Date.now(); closeSheet();
+  if (mode === 'multi') setTimeout(hostTick, 2700);
   banner(); enterRole(app.role); invalidate(); uiTick(); refresh();
   try { navigator.wakeLock && navigator.wakeLock.request('screen').catch(() => { }); } catch (e) { }
   const ses = net.ses;
