@@ -1858,7 +1858,7 @@ function stepR(s, R, dt) {
   if (R.sp <= 0) {
     const lam = 0.26 * adMult(s) * (0.8 + 0.4 * s.rep / 100) * diffOf(s).lam * npLamF(s);
     R.sp = (0.55 + Math.random() * 0.9) / lam;
-    if (anyBurger && S && S.pl > 4) spawnCustomer(s, R);
+    if (anyBurger && s.pl > 4) spawnCustomer(s, R);
   }
   // machines on auto
   if (s.up.fryer >= 3 && R.frT <= 0 && s.pot > 0 && needCount(R, 'f') > onPass(R, 'f')) actR(s, R, { t: 'fr' });
@@ -4362,7 +4362,7 @@ async function boot() {
     if (app.started) try { navigator.wakeLock && navigator.wakeLock.request('screen').catch(() => { }); } catch (e) { }
   });
   requestAnimationFrame(loop);
-  if (window.__KB_TEST) window.__kb = { st, live, S: () => S, isHost: () => isHost, app, net, D, P: () => P, startRun, endRun, sendCmd, applyCmd, hostTick, doAct, dayAct, RS, nightView, NV, bagCount, setPhaseLeft: v => { if (S) S.pl = v; }, begin, toTitle, peekSave, passCode, normPass, enterLobby, LB, startGame, tutNightStep, debtList, diffOf, npOf, DIFFS, initState, killsOf, killEnemy, genFloor, MEATS, MON, sfx, fameList, doAttack, player: () => P, acState: () => (AC ? AC.state : 'none') };
+  if (window.__KB_TEST) window.__kb = { st, live, S: () => S, isHost: () => isHost, app, net, D, P: () => P, startRun, endRun, sendCmd, applyCmd, hostTick, doAct, dayAct, RS, nightView, NV, bagCount, setPhaseLeft: v => { if (S) S.pl = v; }, begin, toTitle, peekSave, passCode, normPass, enterLobby, LB, startGame, tutNightStep, debtList, diffOf, npOf, DIFFS, initState, killsOf, killEnemy, genFloor, MEATS, MON, sfx, fameList, doAttack, applyCmd, actR, player: () => P, acState: () => (AC ? AC.state : 'none') };
 }
 boot();
 
