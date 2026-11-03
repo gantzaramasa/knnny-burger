@@ -2828,8 +2828,14 @@ function dgUpdate(dt) {
     const n = D.drops[i]; n.t += dt;
     if (n.t <= 0.25) continue;
     const dx = P.x - n.x, dy = P.y - n.y, dd = Math.hypot(dx, dy);
-    if (dd < 34 && dd > 1) { n.x += dx / dd * 150 * dt; n.y += dy / dd * 150 * dt; }   // drops drift to the hunter, so a kill never reads as "nothing dropped"
-    if (dd < 18 && tryPick(n)) D.drops.splice(i, 1);
+    if (dd < 18 && tryPick(n)) { D.drops.splice(i, 1); continue; }
+    // every drop homes to the hunter (wall-aware), so a kill — even a boss killed from
+    // attack range — never reads as "nothing dropped"
+    if (dd > 1) {
+      const sp = 260 * dt, mx = dx / dd * sp, my = dy / dd * sp;
+      if (!hitsWall(n.x + mx, n.y, 3)) n.x += mx;
+      if (!hitsWall(n.x, n.y + my, 3)) n.y += my;
+    }
   }
 
   const dp = Math.hypot(P.x - D.m.portal.x, P.y - D.m.portal.y);
@@ -3819,7 +3825,7 @@ function sfx(kind) {
     if (lastSfx[kind] && now - lastSfx[kind] < 90) return;
     lastSfx[kind] = now;
     if (!AC) { const Ctx = window.AudioContext || window.webkitAudioContext; if (!Ctx) return; AC = new Ctx(); }
-    if (AC.state === 'suspended') { AC.resume(); if (AC.state === 'suspended') return; }
+    if (AC.state === 'suspended') AC.resume();   // scheduled tones play as soon as it unlocks
     const t = AC.currentTime;
     const tone = (f0, f1, dur, type, v, delay) => {
       const o = AC.createOscillator(), g = AC.createGain(), at = t + (delay || 0);
@@ -3844,7 +3850,14 @@ function sfx(kind) {
     else if (kind === 'lose') [392, 330, 262, 196].forEach((f, i) => tone(f, 0, 0.25, 'triangle', 0.065, i * 0.13));
   } catch (e) { }
 }
-addEventListener('pointerdown', () => { try { if (AC && AC.state === 'suspended') AC.resume(); } catch (e) { } }, true);
+addEventListener('pointerdown', () => {
+  // create/resume the audio context inside a real tap, so gameplay sounds (fired from
+  // the animation loop) are never stuck behind the browser's autoplay lock
+  try {
+    if (!AC) { const Ctx = window.AudioContext || window.webkitAudioContext; if (Ctx) AC = new Ctx(); }
+    if (AC && AC.state === 'suspended') AC.resume();
+  } catch (e) { }
+}, true);
 
 /* ===== 12 ui shell ===== */
 const panels = [];
@@ -4349,7 +4362,7 @@ async function boot() {
     if (app.started) try { navigator.wakeLock && navigator.wakeLock.request('screen').catch(() => { }); } catch (e) { }
   });
   requestAnimationFrame(loop);
-  if (window.__KB_TEST) window.__kb = { st, live, S: () => S, isHost: () => isHost, app, net, D, P: () => P, startRun, endRun, sendCmd, applyCmd, hostTick, doAct, dayAct, RS, nightView, NV, bagCount, setPhaseLeft: v => { if (S) S.pl = v; }, begin, toTitle, peekSave, passCode, normPass, enterLobby, LB, startGame, tutNightStep, debtList, diffOf, npOf, DIFFS, initState, killsOf, killEnemy, genFloor, MEATS, MON, sfx, fameList };
+  if (window.__KB_TEST) window.__kb = { st, live, S: () => S, isHost: () => isHost, app, net, D, P: () => P, startRun, endRun, sendCmd, applyCmd, hostTick, doAct, dayAct, RS, nightView, NV, bagCount, setPhaseLeft: v => { if (S) S.pl = v; }, begin, toTitle, peekSave, passCode, normPass, enterLobby, LB, startGame, tutNightStep, debtList, diffOf, npOf, DIFFS, initState, killsOf, killEnemy, genFloor, MEATS, MON, sfx, fameList, doAttack, player: () => P, acState: () => (AC ? AC.state : 'none') };
 }
 boot();
 
