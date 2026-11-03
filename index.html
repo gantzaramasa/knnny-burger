@@ -1470,7 +1470,7 @@ const blankUp = () => ({ weapon: 0, armor: 0, bag: 0, floor: 0, grill: 0, fryer:
 const initState = mode => ({
   v: 3, mode: mode === 'solo' ? 'solo' : 'multi', diff: 'normal', np: 1, seed: Math.floor(Math.random() * 1e9), day: 1, phase: 'day', pl: T_DAY, money: 20000, rep: 50,
   meat: { slime: 6 }, pat: { slime: 4 }, pot: 0, ber: 0, prep: [],
-  up: blankUp(), rec: {}, seen: { slime: 1 }, di: 0, over: null, last: null,
+  up: blankUp(), rec: {}, seen: { slime: 1 }, di: 0, over: null, last: null, kills: null,
   tot: { sales: 0, served: 0 }, fame: {}, R: null, gen: rid()
 });
 const EMPTY = initState();
@@ -1531,6 +1531,15 @@ function applyCmd(c) {
     const p = clamp(Math.floor(+c.pot || 0), 0, 400), b = clamp(Math.floor(+c.ber || 0), 0, 400);
     S.pot += p; S.ber += b; n += p + b;
     if (n) { addFame(c.uid, who, 'dep', n); markDirty(true); }
+    return '';
+  }
+  if (c.type === 'kill') {
+    // a monster killed today stays dead today, for everyone (ids are genFloor array indexes)
+    const fl = c.fl | 0, i = c.i | 0;
+    if (fl < 1 || fl > 4 || i < 0 || i > 999) return '';
+    if (!S.kills || S.kills.d !== S.day) S.kills = { d: S.day };
+    const arr = S.kills[fl] || (S.kills[fl] = []);
+    if (!arr.includes(i)) { arr.push(i); markDirty(); }
     return '';
   }
   if (c.type === 'pload') {
@@ -1898,7 +1907,7 @@ const net = {
   uid: '', meId: '', canWrite: null, tab: rid(), snapReady: false, profileName: '',
   P: { state: 'kb/none', host: 'kb/nohost', inbox: 'kb/none/in' }, ses: 0, offs: [], named: null
 };
-const app = { mode: '', pass: '', role: store.get('kb_role', 'ex'), name: store.get('kb_name', ''), diff: DIFFS[store.get('kb_diff', 'normal')] ? store.get('kb_diff', 'normal') : 'normal', started: false, tab: 'go', lastRun: null, seenOver: '' };
+const app = { mode: '', pass: '', role: store.get('kb_role', 'ex'), name: store.get('kb_name', ''), diff: DIFFS[store.get('kb_diff', 'normal')] ? store.get('kb_diff', 'normal') : 'normal', started: false, tab: 'go', lastRun: null, seenOver: '', dayKills: new Set() };
 /* solo players do everything, so they get both specialties */
 const chefHands = () => app.mode === 'solo' || app.role === 'shop';
 const exPerks = () => app.mode === 'solo' || app.role === 'ex';
@@ -2229,6 +2238,13 @@ function bindRoom() {
     const d = msg.data || {};
     if (!D.on || d.fl !== D.fl || d.sd !== D.sd || !(isFinite(d.x) && isFinite(d.y))) return;
     D.fx.push({ k: 'ping', x: +d.x, y: +d.y, t: 5, n: cleanName(d.n) });
+  });
+  on('kill', msg => {
+    const d = msg.data || {}, id = d.i | 0;
+    app.dayKills.add(st().day + ':' + (d.fl | 0) + ':' + id);
+    if (!D.on || d.fl !== D.fl || d.sd !== D.sd) return;
+    const i = D.enemies.findIndex(e => e.id === id);
+    if (i >= 0) { D.fx.push({ k: 'pop', x: D.enemies[i].x, y: D.enemies[i].y, c: '#fff7e8', t: 0.35 }); D.enemies.splice(i, 1); }
   });
   on('act', msg => {
     if (!isHost || !S || msg.sameTab) return;
@@ -2597,6 +2613,14 @@ function genFloor(seed, fl) {
   for (let i = 0; !res && i < 10; i++) res = tryGen(i ? seed + '~' + i : seed, fl);
   return res;
 }
+/* enemy ids killed today on a floor: the shared record (S.kills, host-kept) plus this
+   device's own kills, which apply instantly even before the host's copy comes back */
+function killsOf(s, fl) {
+  const set = new Set();
+  if (s && s.kills && s.kills.d === s.day && Array.isArray(s.kills[fl])) for (const i of s.kills[fl]) set.add(i | 0);
+  if (s) for (const k of app.dayKills) { const p = k.split(':'); if (+p[0] === s.day && +p[1] === fl) set.add(+p[2]); }
+  return set;
+}
 const solid = (tx, ty) => tx < 0 || ty < 0 || tx >= MW || ty >= MH || D.m.g[ty * MW + tx] === 1;
 function hitsWall(x, y, r) {
   const a = Math.floor((x - r) / TS), b = Math.floor((x + r) / TS), c = Math.floor((y - r) / TS), d = Math.floor((y + r) / TS);
@@ -2617,7 +2641,8 @@ function startRun(fl, carry) {
   const seed = s.seed + ':' + fl + ':' + s.day;
   const m = genFloor(seed, fl);
   D.on = true; D.fl = fl; D.sd = hashStr(seed) % 100000; D.m = m; D.fx = []; D.drops = []; D.ghosts = {}; D.t = 0; D.msgT = 0; D.lastSent = ''; D.warned = false;
-  D.enemies = m.enemies.map(e => { const d = MON[e.t]; return Object.assign({}, d, { t: e.t, x: e.x, y: e.y, mhp: d.hp, cd: 0, flash: 0, kb: 0, kx: 0, ky: 0, aggro: d.boss ? 230 : 150, wob: Math.random() * 6, hopT: Math.random() * 2, chT: 0, face: 1 }); });
+  const killed = killsOf(s, fl);
+  D.enemies = m.enemies.map((e, id) => { const d = MON[e.t]; return Object.assign({}, d, { id, t: e.t, x: e.x, y: e.y, mhp: d.hp, cd: 0, flash: 0, kb: 0, kx: 0, ky: 0, aggro: d.boss ? 230 : 150, wob: Math.random() * 6, hopT: Math.random() * 2, chT: 0, face: 1 }); }).filter(e => !killed.has(e.id));
   D.nodes = m.nodes.map(n => Object.assign({}, n));
   D.seen = new Uint8Array(MW * MH);
   const mhp = hpOf(s);
@@ -2642,6 +2667,13 @@ function killEnemy(i) {
   for (let k = 0; k < cnt; k++) addDrop(e.x, e.y, { k: 'meat', m: e.meat });
   D.fx.push({ k: 'pop', x: e.x, y: e.y, c: '#fff7e8', t: 0.35 });
   if (e.boss) dmsg('ボス撃破！');
+  if (e.id != null) {
+    // record the kill: on this device at once, on the host via a command, and live to
+    // everyone currently on the same floor via a room message
+    app.dayKills.add(st().day + ':' + D.fl + ':' + e.id);
+    sendCmd({ type: 'kill', fl: D.fl, i: e.id });
+    if (net.room) net.room.emit('kill', { fl: D.fl, sd: D.sd, i: e.id }).catch(() => { });
+  }
   D.enemies.splice(i, 1);
 }
 function doAttack() {
@@ -3927,7 +3959,7 @@ const PW = { key: '', gen: '' };
 function phaseWatch() {
   if (!app.started) return;
   const s = st(), g = (isHost && S) ? S.gen : V ? V.gen : '';
-  if (g && PW.gen && g !== PW.gen) { app.resShown = 0; app.overShown = ''; PW.key = ''; if (modalOpen()) closeSheet(); toast('新しいゲーム', 'good'); debtFaceIdx = -1; }
+  if (g && PW.gen && g !== PW.gen) { app.resShown = 0; app.overShown = ''; PW.key = ''; app.dayKills.clear(); if (modalOpen()) closeSheet(); toast('新しいゲーム', 'good'); debtFaceIdx = -1; }
   if (g) PW.gen = g;
   const key = s.day + ':' + s.phase;
   if (key !== PW.key) {
@@ -4228,7 +4260,7 @@ async function boot() {
     if (app.started) try { navigator.wakeLock && navigator.wakeLock.request('screen').catch(() => { }); } catch (e) { }
   });
   requestAnimationFrame(loop);
-  if (window.__KB_TEST) window.__kb = { st, live, S: () => S, isHost: () => isHost, app, net, D, P: () => P, startRun, endRun, sendCmd, applyCmd, hostTick, doAct, dayAct, RS, nightView, NV, bagCount, setPhaseLeft: v => { if (S) S.pl = v; }, begin, toTitle, peekSave, passCode, normPass, enterLobby, LB, startGame, tutNightStep, debtList, diffOf, npOf, DIFFS, initState };
+  if (window.__KB_TEST) window.__kb = { st, live, S: () => S, isHost: () => isHost, app, net, D, P: () => P, startRun, endRun, sendCmd, applyCmd, hostTick, doAct, dayAct, RS, nightView, NV, bagCount, setPhaseLeft: v => { if (S) S.pl = v; }, begin, toTitle, peekSave, passCode, normPass, enterLobby, LB, startGame, tutNightStep, debtList, diffOf, npOf, DIFFS, initState, killsOf, killEnemy, genFloor };
 }
 boot();
 
