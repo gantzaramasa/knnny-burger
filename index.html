@@ -197,7 +197,17 @@ button.empty.go { width: 100%; justify-content: center; border: 3px dashed rgba(
 #sc-night { margin-top: 8px; position: relative; }
 .nhint { position: absolute; z-index: 3; left: 12px; right: 12px; top: 58px; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 4px 8px; background: rgba(18,12,31,.88); border: 2px solid var(--line); font-size: 13px; color: var(--cream); pointer-events: none; }
 .nhint .stp { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; }
+.nhint .stp.on { background: var(--mustard); color: var(--edge); padding: 2px 6px; }
+.nhint .stp.hot { background: var(--ketchup); color: var(--cream); padding: 2px 6px; }
 .nhint .arr { color: var(--mustard); }
+.tut { margin-top: 8px; display: flex; align-items: center; justify-content: center; gap: 8px; padding: 6px 10px; background: rgba(18,12,31,.92); border: 2px solid var(--mustard); font-size: 15px; color: var(--cream); pointer-events: none; }
+.tut .arw { color: var(--mustard); animation: tutb .7s ease-in-out infinite alternate; }
+@keyframes tutb { from { transform: translateY(-2px); } to { transform: translateY(2px); } }
+.dwrap { display: flex; align-items: center; gap: 8px; }
+.dwrap .dlab { font-size: 14px; color: var(--dim); white-space: nowrap; }
+.dcards { display: flex; gap: 6px; flex: 1; }
+.dcards .dbtn { flex: 1; min-height: 40px; font-size: 15px; }
+.dcards .dbtn.on { background: var(--mustard); color: var(--edge); box-shadow: inset 0 -3px 0 var(--mustard-d), inset 0 3px 0 rgba(255,255,255,.45); }
 .nhud { display: flex; align-items: center; gap: 10px; padding: 4px 8px; min-height: 40px; font-size: 16px; }
 .nhud .tbar { flex: 1; min-width: 40px; }
 .nhud .ns { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; font-variant-numeric: tabular-nums; }
@@ -304,7 +314,7 @@ body.night .feed, body.dg .feed { bottom: calc(120px + env(safe-area-inset-botto
 .frow .st { display: inline-flex; align-items: center; gap: 4px; }
 .how { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
 .how li { display: flex; align-items: center; gap: 10px; font-size: 15px; color: var(--dim); }
-@media (prefers-reduced-motion: reduce) { .pop, .bigmsg { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .pop, .bigmsg, .tut .arw { animation: none; } }
 </style>
 
 </head>
@@ -324,6 +334,7 @@ body.night .feed, body.dg .feed { bottom: calc(120px + env(safe-area-inset-botto
   <button id="debt" class="debt pf" type="button" aria-label="返済スケジュール" hidden><span id="debt-face"></span><span class="dt"><span class="dl"><b id="debt-amt"></b><span id="debt-days"></span></span><span class="dbar" id="dbarw"><i id="debt-fill"></i></span></span></button>
   <div id="banner" class="banner pf" hidden></div>
   <main>
+    <div id="tut" class="tut" hidden></div>
     <section id="sc-town" hidden>
       <div id="town"></div>
       <div id="dgwrap" class="dgwrap" hidden>
@@ -1425,7 +1436,23 @@ const DEBT_TOTAL = DEBTS.reduce((a, d) => a + d.amt, 0);
 /* playing alone: same amounts, later deadlines, more meat per kill */
 const SOLO_DAYS = [4, 8, 12, 14, 16, 17, 18], SOLO_MEAT = 1.5;
 const DEBTS_SOLO = DEBTS.map((d, i) => ({ d: SOLO_DAYS[i], amt: d.amt }));
-const debtList = s => (s && s.mode === 'solo' ? DEBTS_SOLO : DEBTS);
+/* difficulty + party size: debt totals, customer flow and patience scale together.
+   Old saves have no diff/np and read as normal / 1 player, so nothing breaks. */
+const DIFFS = {
+  easy: { n: 'やさしい', debt: 0.7, lam: 0.85, pat: 1.2 },
+  normal: { n: 'ふつう', debt: 1, lam: 1, pat: 1 },
+  hard: { n: 'むずかしい', debt: 1.3, lam: 1.15, pat: 0.9 }
+};
+const diffOf = s => DIFFS[s && s.diff] || DIFFS.normal;
+const npOf = s => clamp(Math.round((s && s.np) || 1), 1, 4);
+const npDebtF = s => (s && s.mode === 'solo') ? 1 : 1 + 0.15 * (npOf(s) - 1);
+const npLamF = s => (s && s.mode === 'solo') ? 1 : 0.8 + 0.2 * npOf(s);
+const debtList = s => {
+  const base = s && s.mode === 'solo' ? DEBTS_SOLO : DEBTS;
+  const f = diffOf(s).debt * npDebtF(s);
+  if (f === 1) return base;
+  return base.map(d => ({ d: d.d, amt: Math.round(d.amt * f / 1000) * 1000 }));
+};
 const COLLECTORS = [
   { n: 'チンピラのタケ', spr: 'thug', pal: { H: '#ffcc3e', h: '#d99a17', J: '#ee4b3d', j: '#a82c33' }, hi: 'まずは10万。{d}日目の夜に取りに来るぜ', bye: 'チッ、払えるじゃねえか' },
   { n: 'アニキのゴウ', spr: 'thug', pal: { H: '#36334f', h: '#1b1428', J: '#f3efe6', j: '#c9c2b2' }, hi: '次は50万だ。{d}日目の夜に来る', bye: 'ほう…やるな' },
@@ -1441,7 +1468,7 @@ const CHAT = ['肉おねがい', 'もうすぐ帰る', '助けて！', 'ナイ�
 /* ===== 03 state ===== */
 const blankUp = () => ({ weapon: 0, armor: 0, bag: 0, floor: 0, grill: 0, fryer: 0, juice: 0, prep: 0, plates: 0, dish: 0, size: 0, ads: 0, cook: 0, server: 0 });
 const initState = mode => ({
-  v: 3, mode: mode === 'solo' ? 'solo' : 'multi', seed: Math.floor(Math.random() * 1e9), day: 1, phase: 'day', pl: T_DAY, money: 20000, rep: 50,
+  v: 3, mode: mode === 'solo' ? 'solo' : 'multi', diff: 'normal', np: 1, seed: Math.floor(Math.random() * 1e9), day: 1, phase: 'day', pl: T_DAY, money: 20000, rep: 50,
   meat: { slime: 6 }, pat: { slime: 4 }, pot: 0, ber: 0, prep: [],
   up: blankUp(), rec: {}, seen: { slime: 1 }, di: 0, over: null, last: null,
   tot: { sales: 0, served: 0 }, fame: {}, R: null, gen: rid()
@@ -1552,10 +1579,18 @@ function endNight() {
 function startDay() {
   S.day++; S.phase = 'day'; S.pl = T_DAY; markDirty(true);
 }
-let lastKeep = 0;
+let lastKeep = 0, lastNp = 0;
 function hostAdvance(dt) {
   if (!isHost || !S) return;
   dt = Math.min(dt, 1);
+  // party size follows who is actually in the game, so debts and customer flow stay matched to the crew
+  if (S.mode !== 'solo' && Date.now() - lastNp > 2000) {
+    lastNp = Date.now();
+    try {
+      const n = net.room.peers().filter(p => p.kind === 'viewer' && p.presence && p.presence.n && p.presence.sc && p.presence.sc !== 'lobby').length;
+      if (n >= 1 && clamp(n, 1, 4) !== npOf(S)) { S.np = clamp(n, 1, 4); markDirty(); }
+    } catch (e) { }
+  }
   if (!S.over) {
     S.pl -= dt;
     if (S.phase === 'day') { prepTick(S, dt); if (S.pl <= 0) startNight(); }
@@ -1646,7 +1681,7 @@ function makeOrder(s, R) {
   if (s.up.juice && (s.ber > 0 || onPass(R, 'j') > 0) && Math.random() < 0.5) o.push('j');
   return o;
 }
-function patienceMax(s, vip) { return clamp(25 - 0.6 * Math.max(0, s.day - 3), 14, 25) * (vip ? 0.75 : 1); }
+function patienceMax(s, vip) { return clamp(25 - 0.6 * Math.max(0, s.day - 3), 14, 25) * diffOf(s).pat * (vip ? 0.75 : 1); }
 function seatCustomer(s, R, i, c) {
   const o = makeOrder(s, R);
   if (!o) { R.lost++; return false; }
@@ -1803,7 +1838,7 @@ function stepR(s, R, dt) {
   R.so = anyBurger ? 0 : 1;
   R.sp -= dt;
   if (R.sp <= 0) {
-    const lam = 0.26 * adMult(s) * (0.8 + 0.4 * s.rep / 100);
+    const lam = 0.26 * adMult(s) * (0.8 + 0.4 * s.rep / 100) * diffOf(s).lam * npLamF(s);
     R.sp = (0.55 + Math.random() * 0.9) / lam;
     if (anyBurger && S && S.pl > 4) spawnCustomer(s, R);
   }
@@ -1863,7 +1898,7 @@ const net = {
   uid: '', meId: '', canWrite: null, tab: rid(), snapReady: false, profileName: '',
   P: { state: 'kb/none', host: 'kb/nohost', inbox: 'kb/none/in' }, ses: 0, offs: [], named: null
 };
-const app = { mode: '', pass: '', role: store.get('kb_role', 'ex'), name: store.get('kb_name', ''), started: false, tab: 'go', lastRun: null, seenOver: '' };
+const app = { mode: '', pass: '', role: store.get('kb_role', 'ex'), name: store.get('kb_name', ''), diff: DIFFS[store.get('kb_diff', 'normal')] ? store.get('kb_diff', 'normal') : 'normal', started: false, tab: 'go', lastRun: null, seenOver: '' };
 /* solo players do everything, so they get both specialties */
 const chefHands = () => app.mode === 'solo' || app.role === 'shop';
 const exPerks = () => app.mode === 'solo' || app.role === 'ex';
@@ -1998,7 +2033,7 @@ async function openSession(mode, pass, fresh) {
     const t = soloPaths();
     net.room = localRoom(); net.db = t.db; net.P = t.P;
   }
-  if (fresh) { try { await net.db.doc(net.P.state).set(initState(mode)); } catch (e) { } }
+  if (fresh) { try { const st0 = initState(mode); if (DIFFS[app.diff]) st0.diff = app.diff; await net.db.doc(net.P.state).set(st0); } catch (e) { } }
   if (ses !== net.ses) return false;
   subscribeState(ses); bindRoom();
   return true;
@@ -2046,7 +2081,20 @@ function startInbox() {
 }
 function stopInbox() { if (inboxUnsub) { try { inboxUnsub(); } catch (e) { } inboxUnsub = null; } }
 function becomeHost() {
+  const freshState = !V;
   S = V ? clone(V) : initState(app.mode);
+  if (freshState) {
+    // a brand-new shop takes its difficulty from the lobby leader (presence carries it), else from this page
+    if (S.mode !== 'solo') {
+      try {
+        const lead = net.room.peers().filter(p => p.presence && DIFFS[p.presence.diff]).sort((a, b) => ((a.presence.jt || 0) - (b.presence.jt || 0)))[0];
+        if (lead) S.diff = lead.presence.diff;
+        else if (DIFFS[app.diff]) S.diff = app.diff;
+      } catch (e) { if (DIFFS[app.diff]) S.diff = app.diff; }
+    } else if (DIFFS[app.diff]) S.diff = app.diff;
+  }
+  if (!DIFFS[S.diff]) S.diff = 'normal';
+  if (!S.np) S.np = 1;
   if (!S.prep) S.prep = [];
   if (S.R) { resizeR(S, S.R); R_EV = Math.max(R_EV, ...(S.R.ev || []).map(e => e[0]), 0); }
   isHost = true; dirty = true; urgent = true; lastJson = ''; lastKeep = Date.now();
@@ -3612,7 +3660,7 @@ function showDebtInfo() {
     debtLine(s),
     h('div', { class: 'sched' }, debtList(s).map((d, i) => h('div', { class: 'srow' + (i < s.di ? ' paid' : i === s.di ? ' cur' : '') },
       collectorFace(i, 1), h('span', { class: 'sd' }, d.d + '日目'), h('b', null, fmtY(d.amt)), i < s.di ? px('i_check', 2) : null))),
-    h('div', { class: 'srow tot' }, h('span', null, '合計'), h('b', null, fmtY(DEBT_TOTAL))),
+    h('div', { class: 'srow tot' }, h('span', null, '合計'), h('b', null, fmtY(debtList(s).reduce((a, d) => a + d.amt, 0)))),
     btn('閉じる', () => closeSheet(), 'pri block')
   ]);
 }
@@ -3807,6 +3855,21 @@ function renderTeam() {
     online ? h('div', { class: 'phr' }, CHAT.map((t, i) => h('button', { class: 'qc', type: 'button', onclick: () => { sendChat(i); closePop(); } }, t))) : null);
 }
 
+/* tutorial: which night step to point at right now (0 cut, 1 grill, 2 plate, 3 serve, 4 wash); hot = fire */
+function tutNightStep(sv, R) {
+  if (!sv || !R) return { step: 3, hot: false };
+  const ct = cookT(sv);
+  if (R.grill.some(g => g && g.f)) return { step: 1, hot: true };
+  const canServe = R.seats.some(x => x.st === 1 && x.c.o.some((o, j) => !x.c.g[j] && (o === 'f' ? R.pass.some(p => p.k === 'f') : o === 'j' ? R.pass.some(p => p.k === 'j') : R.pass.some(p => p.k === 'b' && p.m === o))));
+  if (canServe) return { step: 3, hot: false };
+  if (R.grill.some(g => g && !g.f && g.t >= ct)) return { step: 2, hot: false };
+  if (R.cb) return { step: 0, hot: false };
+  if (R.grill.some(g => g && !g.f)) return { step: 1, hot: false };
+  if (MK.some(m => (sv.pat && sv.pat[m]) > 0)) return { step: 1, hot: false };
+  if (MK.some(m => (sv.meat && sv.meat[m]) > 0)) return { step: 0, hot: false };
+  if (R.dp > 0) return { step: 4, hot: false };
+  return { step: 3, hot: false };
+}
 /* header */
 let debtFaceIdx = -1;
 function updateHeader() {
@@ -3836,6 +3899,24 @@ function updateHeader() {
     h('span', { class: 'stp' }, px('cust', 1, { H: '#6b3b22', h: '#4a2614', U: '#5cc3ff', u: '#2f6cc2' }), '出す'), h('span', { class: 'arr' }, '▶'),
     h('span', { class: 'stp' }, px('i_sink', 2), '洗う'));
   hint.hidden = !showHint;
+  // tutorial: on the first night, light up the step the player should do next
+  if (showHint && s.day === 1) {
+    const v1 = nightView(), ts = tutNightStep(v1 && v1.s, v1 && v1.R);
+    hint.querySelectorAll('.stp').forEach((el, i) => { el.classList.toggle('on', i === ts.step && !ts.hot); el.classList.toggle('hot', i === ts.step && ts.hot); });
+  }
+  // tutorial: on day 1 daytime, a guide bar points at the next thing to do
+  const tut = $('#tut');
+  let tutTxt = '';
+  if (app.started && s.day === 1 && s.phase === 'day' && !modalOpen()) {
+    if (typeof D !== 'undefined' && D && D.on) tutTxt = '敵を倒して肉を集めよう。出口を長押しで帰れる';
+    else if (curScene === 'prep') tutTxt = (s.prep || []).some(p => p && p.n > 0) ? 'タップで仕込みが早くなる。夜までにパティを増やそう' : (MK.some(m => (s.meat && s.meat[m]) > 0) ? '肉を仕込み台に載せよう' : 'ダンジョンで肉を集めよう');
+    else if (curScene === 'up') tutTxt = '強化は夜に稼いでからでOK';
+    else tutTxt = 'ダンジョンへ出発しよう';
+  }
+  if (tutTxt) {
+    if (tut.dataset.t !== tutTxt) { tut.dataset.t = tutTxt; tut.replaceChildren(h('span', { class: 'arw' }, '▼'), h('span', null, tutTxt)); }
+    tut.hidden = false;
+  } else { tut.hidden = true; tut.dataset.t = ''; }
   if (curScene === 'night') {
     const v = nightView();
     $('#n-time').style.width = clamp(left / T_NIGHT * 100, 0, 100) + '%';
@@ -3916,6 +3997,14 @@ function noMulti() {
     btn([px('hero', 2), 'ひとりで遊ぶ'], () => titleSolo(), 'pri big block')
   ], { dismiss: false });
 }
+/* difficulty picker: applies to a shop created from now on; existing shops keep their own S.diff */
+function diffRow() {
+  const keys = Object.keys(DIFFS);
+  const wrap = h('div', { class: 'dcards' });
+  keys.forEach(k => wrap.append(h('button', { class: 'btn dbtn' + (app.diff === k ? ' on' : ''), type: 'button', onclick: () => { app.diff = k; store.set('kb_diff', k); wrap.querySelectorAll('.dbtn').forEach((x, i) => x.classList.toggle('on', keys[i] === k)); if (LB.on) { lobbyPres(); LB.sig = ''; renderLobby(); } } }, DIFFS[k].n)));
+  return h('div', { class: 'dwrap' }, h('span', { class: 'dlab' }, 'むずかしさ'), wrap);
+}
+const diffNote = s => h('p', { class: 'netl center' }, 'むずかしさ：' + diffOf(s).n + (s && s.mode !== 'solo' && npOf(s) > 1 ? '（' + npOf(s) + '人で調整中）' : ''));
 async function titleSolo() {
   openSheet([h('h2', null, backBtn(), px('hero', 3), 'ひとりで'), h('p', { class: 'dim' }, '読み込み中…')], { dismiss: false });
   const d = await peekSave('solo');
@@ -3929,8 +4018,8 @@ async function titleSolo() {
       if (!armed) { armed = true; fresh.replaceChildren(px('i_skull', 2), 'もう一度で消去'); fresh.classList.add('danger'); return; }
       begin('solo', '', true);
     }, 'ghost');
-    nodes.push(btn([px('i_play', 2), 'つづきから', h('small', { class: 'sv' }, d.day + '日目 ' + fmtY(d.money))], () => begin('solo', '', false), 'pri big block'), fresh);
-  } else nodes.push(btn([px('i_play', 2), 'はじめる'], () => begin('solo', '', !!d), 'pri big block'));
+    nodes.push(btn([px('i_play', 2), 'つづきから', h('small', { class: 'sv' }, d.day + '日目 ' + fmtY(d.money))], () => begin('solo', '', false), 'pri big block'), diffNote(d), fresh);
+  } else nodes.push(diffRow(), btn([px('i_play', 2), 'はじめる'], () => begin('solo', '', !!d), 'pri big block'));
   if (!soloCloud()) nodes.push(h('p', { class: 'netl' }, px('i_lock', 2), 'この端末だけに保存'));
   openSheet(nodes, { dismiss: false });
 }
@@ -3974,7 +4063,7 @@ function lbLeader(ps) {
   return l[0] || null;
 }
 function lobbyPres() {
-  net.room.presence({ n: app.name, role: app.role, sc: 'lobby', host: 0, rdy: LB.rdy, jt: LB.jt, go: null, rs: null, sk: null, fl: null, sd: null, x: null, y: null, hp: null, mhp: null, bag: null }).catch(() => { });
+  net.room.presence({ n: app.name, role: app.role, diff: app.diff, sc: 'lobby', host: 0, rdy: LB.rdy, jt: LB.jt, go: null, rs: null, sk: null, fl: null, sd: null, x: null, y: null, hp: null, mhp: null, bag: null }).catch(() => { });
 }
 async function enterLobby(pass) {
   if (!(await openOrToast('multi', pass, false))) return false;
@@ -4007,7 +4096,7 @@ function renderLobby() {
   const waiting = ps.filter(p => lbIn(p) && !(lead && p.peer === lead.peer));
   const ready = waiting.filter(p => p.presence.rdy).length;
   const v = V;
-  const sig = JSON.stringify([ps.map(p => [p.peer, p.isMe, p.presence.n, p.presence.role, p.presence.sc, p.presence.rdy]), lead && lead.peer, LB.rdy, app.role, v && [v.day, v.phase, Math.floor(v.money / 1e4), v.over], net.room.server && net.room.server(), net.room.connected()]);
+  const sig = JSON.stringify([ps.map(p => [p.peer, p.isMe, p.presence.n, p.presence.role, p.presence.sc, p.presence.rdy, p.presence.diff]), lead && lead.peer, LB.rdy, app.role, app.diff, v && [v.day, v.phase, Math.floor(v.money / 1e4), v.over, v.diff, v.np], net.room.server && net.room.server(), net.room.connected()]);
   if (sig === LB.sig && $('#lobby')) return;
   LB.sig = sig;
   const shop = v ? (v.over ? '前のゲームは終わっています' : v.day + '日目のお店 ・ ' + fmtY(v.money)) : '新しいお店';
@@ -4025,22 +4114,27 @@ function renderLobby() {
     act = btn([px('i_door', 2), '合流する'], () => startGame('multi'), 'pri big block');
     note = playing.length + '人がプレイ中のお店に入ります';
   } else if (iLead) {
-    const all = ready === waiting.length;
+    const alone = waiting.length === 0;
+    const all = !alone && ready === waiting.length;
     act = btn([px('i_play', 2), 'スタート', waiting.length ? h('small', { class: 'sv' }, '準備 ' + ready + '/' + waiting.length) : null], () => {
-      if (!(ready === waiting.length)) return;
+      if (alone || !(ready === waiting.length)) return;
       net.room.presence({ go: rid() }).catch(() => { });
       startGame('multi');
     }, 'pri big block', !all);
-    note = waiting.length ? (all ? 'みんな準備OK！' : 'みんなの準備を待っています') : '友だちに合言葉を伝えてね';
+    note = alone ? 'あと1人を待っています' : (all ? 'みんな準備OK！' : 'みんなの準備を待っています');
   } else {
     act = btn(LB.rdy ? [px('i_check', 2), '準備OK'] : '準備OK', () => { LB.rdy = LB.rdy ? 0 : 1; lobbyPres(); LB.sig = ''; renderLobby(); }, LB.rdy ? 'ok big block' : 'pri big block');
     note = LB.rdy ? 'リーダーのスタートを待っています' : '準備ができたら押してね';
   }
+  const shopDiff = (v && !v.over) ? diffNote(v)
+    : iLead ? diffRow()
+    : h('p', { class: 'netl center' }, 'むずかしさ：' + ((lead && DIFFS[lead.presence.diff]) ? DIFFS[lead.presence.diff].n : 'ふつう'));
   openSheet([
     h('h2', { id: 'lobby' }, h('button', { class: 'ibtn back', type: 'button', 'aria-label': '戻る', onclick: () => toTitle() }, h('span', { class: 'arrl' }, '◀')), px('i_people', 3), 'ロビー'),
     h('div', { class: 'passl' }, h('span', null, '合言葉'), h('b', null, app.pass), h('span', { class: 'grow' }), h('small', null, shop)),
     h('div', { class: 'lrows' }, rows),
     h('div', { class: 'rcards' }, cards),
+    shopDiff,
     act,
     h('p', { class: 'netl center' }, note),
     net.p2p ? h('div', { class: 'netl center' }, px('i_lock', 2), 'セーブはみんなのスマホに残ります',
@@ -4134,7 +4228,7 @@ async function boot() {
     if (app.started) try { navigator.wakeLock && navigator.wakeLock.request('screen').catch(() => { }); } catch (e) { }
   });
   requestAnimationFrame(loop);
-  if (window.__KB_TEST) window.__kb = { st, live, S: () => S, isHost: () => isHost, app, net, D, P: () => P, startRun, endRun, sendCmd, applyCmd, hostTick, doAct, dayAct, RS, nightView, NV, bagCount, setPhaseLeft: v => { if (S) S.pl = v; }, begin, toTitle, peekSave, passCode, normPass, enterLobby, LB, startGame };
+  if (window.__KB_TEST) window.__kb = { st, live, S: () => S, isHost: () => isHost, app, net, D, P: () => P, startRun, endRun, sendCmd, applyCmd, hostTick, doAct, dayAct, RS, nightView, NV, bagCount, setPhaseLeft: v => { if (S) S.pl = v; }, begin, toTitle, peekSave, passCode, normPass, enterLobby, LB, startGame, tutNightStep, debtList, diffOf, npOf, DIFFS, initState };
 }
 boot();
 
