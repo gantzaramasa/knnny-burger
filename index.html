@@ -213,6 +213,7 @@ button.empty.go { width: 100%; justify-content: center; border: 3px dashed rgba(
 .nhud .ns { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .nhud .ns.sales { color: var(--mustard); }
 .nhud .ns.lost { color: #ff9d92; }
+#ngoal { text-align: center; font-size: 12px; color: var(--mustard); padding: 1px 0 3px; min-height: 15px; }
 #ncv { display: block; width: 100%; margin-top: 6px; height: calc(100vh - var(--top) - 140px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)); min-height: 400px; max-height: 860px; touch-action: none; user-select: none; -webkit-user-select: none; border: 3px solid var(--edge); }
 @supports (height: 100svh) { #ncv { height: calc(100svh - var(--top) - 140px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)); } }
 
@@ -363,6 +364,7 @@ body.night .feed, body.dg .feed { bottom: calc(120px + env(safe-area-inset-botto
     <section id="sc-night" hidden>
       <div id="nhint" class="nhint" hidden></div>
       <div class="nhud pf"><span data-px="i_moon"></span><span class="tbar night"><i id="n-time"></i></span><span class="ns sales"><span data-px="i_coin"></span><b id="n-sales">0</b></span><span class="ns"><span data-px="i_people"></span><b id="n-served">0</b></span><span class="ns lost"><span data-px="i_x"></span><b id="n-lost">0</b></span></div>
+      <div id="ngoal"></div>
       <canvas id="ncv" aria-label="お店"></canvas>
     </section>
   </main>
@@ -1352,7 +1354,7 @@ function fmtY(n, noSign) {
 /* ===== 02 game data ===== */
 const T_DAY = 130, T_NIGHT = 110, T_RES = 14;
 const MEATS = {
-  slime: { n: 'スライム', p: 1500, fl: 1, pat: ['#5fe2cf', '#2a9b8b'], top: ['#79d45c', '#3c8f46'] },
+  slime: { n: 'スライム', p: 1500, fl: 1, pat: ['#54baff', '#1f6fd0'], top: ['#aee6ff', '#54baff'] },
   frog: { n: 'カエル', p: 2500, fl: 1, pat: ['#97d36d', '#4f8f3a'], top: ['#ffcc3e', '#d99a17'] },
   boar: { n: 'イノシシ', p: 4500, fl: 2, pat: ['#8b4a2a', '#5e2e18'], top: ['#79d45c', '#3c8f46'] },
   lizard: { n: 'トカゲ', p: 6500, fl: 2, pat: ['#d8743a', '#9a4a1e'], top: ['#ee4b3d', '#a82c33'] },
@@ -1439,9 +1441,9 @@ const DEBTS_SOLO = DEBTS.map((d, i) => ({ d: SOLO_DAYS[i], amt: d.amt }));
 /* difficulty + party size: debt totals, customer flow and patience scale together.
    Old saves have no diff/np and read as normal / 1 player, so nothing breaks. */
 const DIFFS = {
-  easy: { n: 'やさしい', debt: 0.7, lam: 0.85, pat: 1.2 },
-  normal: { n: 'ふつう', debt: 1, lam: 1, pat: 1 },
-  hard: { n: 'むずかしい', debt: 1.3, lam: 1.15, pat: 0.9 }
+  easy: { n: 'やさしい', debt: 0.75, lam: 0.85, pat: 1.2 },
+  normal: { n: 'ふつう', debt: 1.05, lam: 1, pat: 1 },
+  hard: { n: 'むずかしい', debt: 1.4, lam: 1.15, pat: 0.9 }
 };
 const diffOf = s => DIFFS[s && s.diff] || DIFFS.normal;
 const npOf = s => clamp(Math.round((s && s.np) || 1), 1, 4);
@@ -1570,13 +1572,20 @@ function startNight() {
   // meat still waiting on the prep table goes back to the raw tray (it can be chopped by hand tonight)
   for (const p of S.prep || []) if (p && p.n > 0) S.meat[p.m] = (S.meat[p.m] || 0) + p.n;
   S.prep = [];
+  S.fame0 = JSON.parse(JSON.stringify(S.fame || {}));   // per-night MVP: snapshot before the shift
   S.phase = 'night'; S.pl = T_NIGHT; S.R = newR(S); markDirty(true);
 }
 function endNight() {
   const R = S.R || newR(S);
   for (const g of R.grill) if (g && g.m && !g.f && g.t < cookT(S) * 2) S.pat[g.m] = (S.pat[g.m] || 0) + 1;
   if (R.cb) S.meat[R.cb.m] = (S.meat[R.cb.m] || 0) + 1;
-  const last = { day: S.day, sales: R.sales, tips: R.tips, served: R.served, lost: R.lost, vip: R.vip, burnt: R.burnt, fires: R.fires || 0, best: R.best || null, paid: -1, fail: -1 };
+  const fameD = [];
+  for (const uid in (S.fame || {})) {
+    const a = S.fame[uid], b = (S.fame0 || {})[uid] || {}, d = { n: a.n, dep: (a.dep || 0) - (b.dep || 0), prep: (a.prep || 0) - (b.prep || 0), srv: (a.srv || 0) - (b.srv || 0), fire: (a.fire || 0) - (b.fire || 0) };
+    if (d.dep + d.prep + d.srv + d.fire > 0) fameD.push(d);
+  }
+  delete S.fame0;
+  const last = { day: S.day, sales: R.sales, tips: R.tips, served: R.served, lost: R.lost, vip: R.vip, burnt: R.burnt, fires: R.fires || 0, best: R.best || null, paid: -1, fail: -1, fame: fameD };
   S.tot.sales += R.sales; S.tot.served += R.served;
   const d = due(S);
   if (d && S.day >= d.d) {
@@ -1907,7 +1916,7 @@ const net = {
   uid: '', meId: '', canWrite: null, tab: rid(), snapReady: false, profileName: '',
   P: { state: 'kb/none', host: 'kb/nohost', inbox: 'kb/none/in' }, ses: 0, offs: [], named: null
 };
-const app = { mode: '', pass: '', role: store.get('kb_role', 'ex'), name: store.get('kb_name', ''), diff: DIFFS[store.get('kb_diff', 'normal')] ? store.get('kb_diff', 'normal') : 'normal', started: false, tab: 'go', lastRun: null, seenOver: '', dayKills: new Set() };
+const app = { mode: '', pass: '', role: store.get('kb_role', 'ex'), name: store.get('kb_name', ''), diff: DIFFS[store.get('kb_diff', 'normal')] ? store.get('kb_diff', 'normal') : 'normal', started: false, tab: 'go', lastRun: null, seenOver: '', dayKills: new Set(), storyGen: '', bootStory: 0 };
 /* solo players do everything, so they get both specialties */
 const chefHands = () => app.mode === 'solo' || app.role === 'shop';
 const exPerks = () => app.mode === 'solo' || app.role === 'ex';
@@ -2144,6 +2153,7 @@ function doAct(a) {
   if (isHost && S && S.R) {
     const r = actR(S, S.R, a);
     if (r === 'ok' && a.t === 'se') addFame(net.uid, app.name, 'srv', 1);
+    if (r === 'out' && a.t === 'tk') addFame(net.uid, app.name, 'fire', 1);
     markDirty(); return r;
   }
   if (!RS.R || !RS.s) return 'no';
@@ -2257,6 +2267,7 @@ function bindRoom() {
     if (!S.R || S.phase !== 'night') return;
     const r = actR(S, S.R, { t, m: String(a.m || ''), i: a.i | 0, c });
     if (r === 'ok' && t === 'se') addFame(who, d.n, 'srv', 1);
+    if (r === 'out' && t === 'tk') addFame(who, d.n, 'fire', 1);
     markDirty();
   });
   net.offs.push(room.onPeers(() => { }, () => { }));
@@ -3184,19 +3195,19 @@ function drawSeat(c, v, L, i, tnow) {
     if (lk.acc === 'glasses') c.drawImage(sprCv('glasses'), cx - 7, Math.round(by), 14, 7);
     else if (lk.acc === 'cap') c.drawImage(sprCv('cap', { V: lk.cap }), cx - 7, Math.round(by - 2), 14, 5);
     else if (lk.acc === 'vip') { c.drawImage(sprCv('shades'), cx - 7, Math.round(by), 14, 7); c.drawImage(sprCv('chain'), cx - 7, Math.round(by), 14, 14); }
-    if (x.st === 2) c.drawImage(sprCv('mb', burgerPal(cu.o[0])), cx - 4, Math.round(by + 8), 8, 7);
+    if (x.st === 2) c.drawImage(sprCv('mb', burgerPal(cu.o[0])), cx - 5, Math.round(by + 7), 10, 9);
     if (x.st === 1) {
-      const ws = cu.o.map(o => o === 'f' ? 6 : o === 'j' ? 5 : 8);
-      const bw = ws.reduce((a, b) => a + b + 1, -1) + 4, bh = 11;
+      const ws = cu.o.map(o => o === 'f' ? 7 : o === 'j' ? 6 : 10);
+      const bw = ws.reduce((a, b) => a + b + 1, -1) + 4, bh = 13;
       const bx = Math.round(clamp(cx - bw / 2, 0, L.W - bw)), byy = Math.round(by - bh - 3 - (p.stag && L.seats.length > 3 ? 4 : 0));
       box(c, bx, byy, bw, bh, cu.vip ? '#fff3c2' : '#fff7e8');
       px1(c, cx - 1, byy + bh, 2, 2, cu.vip ? '#fff3c2' : '#fff7e8');
       let xx = bx + 2;
       cu.o.forEach((o, j) => {
         c.save(); if (cu.g[j]) c.globalAlpha = 0.22;
-        if (o === 'f') c.drawImage(sprCv('mf'), xx, byy + 2, 6, 8);
-        else if (o === 'j') c.drawImage(sprCv('mj'), xx, byy + 2, 5, 8);
-        else c.drawImage(sprCv('mb', burgerPal(o)), xx, byy + 2, 8, 7);
+        if (o === 'f') c.drawImage(sprCv('mf'), xx, byy + 2, 7, 10);
+        else if (o === 'j') c.drawImage(sprCv('mj'), xx, byy + 2, 6, 10);
+        else c.drawImage(sprCv('mb', burgerPal(o)), xx, byy + 2, 10, 9);
         c.restore(); xx += ws[j] + 1;
       });
       const fr = clamp(cu.p / cu.pm, 0, 1);
@@ -3236,7 +3247,11 @@ function drawSlot(c, r, g, ct, tnow, i) {
   px1(c, gx + clamp(Math.round(gw * f / 2), 0, gw - 1), gy - 1, 1, 4, '#fff7e8');
   if (f < 2 && Math.floor(tnow * 6 + i) % 2) px1(c, cx - 3 + ((i * 3 + Math.floor(tnow * 5)) % 6), cy - 5, 1, 1, '#fff7e8');
   if (f >= 2) { c.globalAlpha = 0.7 + 0.3 * Math.sin(tnow * 10); c.drawImage(sprCv('smoke'), cx - 3, Math.round(cy - 10 - (tnow * 8) % 4), 6, 5); c.globalAlpha = 1; }
-  if (f >= 1 && f < 1.45) { c.strokeStyle = '#79d45c'; c.strokeRect(Math.round(r.x) + 1.5, Math.round(r.y) + 1.5, Math.round(r.w) - 3, Math.round(r.h) - 3); }
+  if (f >= 1 && f < 1.45) {
+    c.strokeStyle = '#79d45c'; c.strokeRect(Math.round(r.x) + 1.5, Math.round(r.y) + 1.5, Math.round(r.w) - 3, Math.round(r.h) - 3);
+    if (!NV['rd' + i]) { NV['rd' + i] = 1; sfx('ding'); }   // just reached the best zone
+  } else if (f < 1) NV['rd' + i] = 0;
+  if (f >= 1.45 && f < 2 && Math.floor(tnow * 5 + i) % 2) { c.strokeStyle = '#ee4b3d'; c.lineWidth = 1; c.strokeRect(Math.round(r.x) + 0.5, Math.round(r.y) + 0.5, Math.round(r.w) - 1, Math.round(r.h) - 1); }
 }
 function drawBoard(c, r, R, tnow) {
   box(c, r.x, r.y, r.w, r.h, '#d8a66a', '#6b3b22');
@@ -3359,9 +3374,9 @@ function drawNight(tnow) {
     if (e[0] <= NV.lastEv) continue;
     NV.lastEv = e[0];
     const p = L.seats[e[2]];
-    if (e[1] === 'pay' && p) NV.fx.push({ k: 'coin', x: p.x + p.w / 2, y: p.y + p.h - 18, v: e[3], t: 1.4 });
-    else if (e[1] === 'angry' && p) NV.fx.push({ k: 'angry', x: p.x + p.w / 2, y: p.y + p.h - 22, t: 1.2 });
-    else if (e[1] === 'fire') { const sl = L.slots[e[2]]; if (sl) NV.fx.push({ k: 'say', s: '火事！', x: sl.x + sl.w / 2, y: sl.y + 4, t: 1.2, col: '#ee4b3d' }); }
+    if (e[1] === 'pay' && p) { NV.fx.push({ k: 'coin', x: p.x + p.w / 2, y: p.y + p.h - 18, v: e[3], t: 1.4 }); sfx('coin'); }
+    else if (e[1] === 'angry' && p) { NV.fx.push({ k: 'angry', x: p.x + p.w / 2, y: p.y + p.h - 22, t: 1.2 }); sfx('angry'); }
+    else if (e[1] === 'fire') { const sl = L.slots[e[2]]; if (sl) NV.fx.push({ k: 'say', s: '火事！', x: sl.x + sl.w / 2, y: sl.y + 4, t: 1.2, col: '#ee4b3d' }); sfx('fire'); }
   }
   nox.imageSmoothingEnabled = false;
   nox.clearRect(0, 0, W, H);
@@ -3380,7 +3395,7 @@ function nightTap(e) {
   const inR = q => q && x >= q.x && x < q.x + q.w && y >= q.y && y < q.y + q.h;
   const fb = (res, key, fx, fy) => {
     NV.fx.push({ k: 'tap', x: fx, y: fy, t: 0.25 });
-    if (res === 'ok' || res === 'clean' || res === 'trash' || res === 'done' || res === 'out') return res;
+    if (res === 'ok' || res === 'clean' || res === 'trash' || res === 'done' || res === 'out') { sfx('pop'); return res; }
     NV.shake[key] = 0.35;
     if (res === 'noplate') { NV.shake.sink = 0.6; NV.fx.push({ k: 'say', s: SAY.noplate, x: L.sink.x + L.sink.w / 2, y: L.sink.y, t: 0.9, col: '#ee4b3d' }); }
     else if (res === 'passfull') NV.shake.pass = 0.5;
@@ -3721,6 +3736,8 @@ function showNightResult(s) {
       L.fires ? h('span', { class: 'st bad', title: '火事' }, px('flame', 2), h('b', null, L.fires)) : null),
     L.best ? h('div', { class: 'best' }, px('burger', 2, burgerPal(L.best.m)), h('span', null, '最高 ' + fmtY(L.best.v))) : null
   ];
+  if (L.paid >= 0) sfx('pay');
+  if (L.fame && L.fame.length) nodes.push(fameList(s, L.fame));
   if (L.paid >= 0) {
     const C = COLLECTORS[L.paid];
     nodes.push(h('div', { class: 'paid' }, collectorFace(L.paid, 3), h('div', { class: 'grow' }, h('b', null, C.n), h('p', { class: 'say' }, '「' + C.bye + '」')), h('span', { class: 'stamp' }, '返済')));
@@ -3731,6 +3748,7 @@ function showNightResult(s) {
   openSheet(nodes, { cls: 'res' });
 }
 function showGameOver(s) {
+  sfx('lose'); vib([120, 60, 120]);
   const i = s.last && s.last.fail >= 0 ? s.last.fail : s.di, C = COLLECTORS[Math.min(i, COLLECTORS.length - 1)];
   const d = debtList(s)[i];
   openSheet([
@@ -3750,6 +3768,7 @@ function showGameOver(s) {
   ], { dismiss: false, cls: 'oversheet' });
 }
 function showEnding(s) {
+  sfx('win'); vib([60, 40, 60, 40, 120]);
   openSheet([
     h('div', { class: 'scenebox' }, sceneCanvas((c, t, w, hh) => {
       sky(c, w, hh, '#2a1d50'); ground(c, w, hh);
@@ -3767,13 +3786,48 @@ function showEnding(s) {
     btn('もう一度あそぶ', () => { sendCmd({ type: 'reset', force: 1 }); closeSheet(); }, 'pri block')
   ], { dismiss: false, cls: 'oversheet' });
 }
-function fameList(s) {
-  const f = Object.values(s.fame || {});
+function fameList(s, list) {
+  const f = list || Object.values(s.fame || {});
   if (!f.length) return null;
-  return h('div', { class: 'fame' }, f.sort((a, b) => (b.dep + b.prep + b.srv) - (a.dep + a.prep + a.srv)).slice(0, 4).map(x => h('div', { class: 'frow' },
+  const tot = x => (x.dep || 0) + (x.prep || 0) + (x.srv || 0) + (x.fire || 0);
+  return h('div', { class: 'fame' }, f.slice().sort((a, b) => tot(b) - tot(a)).slice(0, 4).map((x, i) => h('div', { class: 'frow' },
+    i === 0 && f.length > 1 ? px('crown', 2) : null,
     h('b', null, cleanName(x.n) || '？'),
-    h('span', { class: 'st' }, px('i_meat', 2), x.dep || 0), h('span', { class: 'st' }, px('patty', 2, meatPal('boar')), x.prep || 0), h('span', { class: 'st' }, px('i_people', 2), x.srv || 0))));
+    h('span', { class: 'st' }, px('i_meat', 2), x.dep || 0), h('span', { class: 'st' }, px('patty', 2, meatPal('boar')), x.prep || 0), h('span', { class: 'st' }, px('i_people', 2), x.srv || 0), x.fire ? h('span', { class: 'st' }, px('flame', 2), x.fire) : null)));
 }
+
+/* ---------- sound & vibration (synthesized, no audio files; toggle in the menu) ---------- */
+let AC = null;
+const sfxMuted = () => store.get('kb_mute', '') === '1';
+function vib(p) { try { if (!sfxMuted() && navigator.vibrate) navigator.vibrate(p); } catch (e) { } }
+const lastSfx = {};
+function sfx(kind) {
+  try {
+    if (sfxMuted()) return;
+    const now = performance.now();
+    if (lastSfx[kind] && now - lastSfx[kind] < 90) return;
+    lastSfx[kind] = now;
+    if (!AC) { const Ctx = window.AudioContext || window.webkitAudioContext; if (!Ctx) return; AC = new Ctx(); }
+    if (AC.state === 'suspended') { AC.resume(); if (AC.state === 'suspended') return; }
+    const t = AC.currentTime;
+    const tone = (f0, f1, dur, type, v, delay) => {
+      const o = AC.createOscillator(), g = AC.createGain(), at = t + (delay || 0);
+      o.type = type; o.frequency.setValueAtTime(f0, at);
+      if (f1) o.frequency.exponentialRampToValueAtTime(Math.max(30, f1), at + dur);
+      g.gain.setValueAtTime(v, at); g.gain.exponentialRampToValueAtTime(0.001, at + dur);
+      o.connect(g); g.connect(AC.destination); o.start(at); o.stop(at + dur + 0.02);
+    };
+    if (kind === 'pop') tone(520, 880, 0.07, 'square', 0.045);
+    else if (kind === 'ding') { tone(1318, 0, 0.12, 'sine', 0.075); tone(1760, 0, 0.16, 'sine', 0.05, 0.07); }
+    else if (kind === 'coin') { tone(988, 0, 0.08, 'square', 0.045); tone(1319, 0, 0.15, 'square', 0.045, 0.06); }
+    else if (kind === 'fire') { tone(620, 440, 0.14, 'sawtooth', 0.06); tone(620, 440, 0.14, 'sawtooth', 0.06, 0.18); vib([70, 40, 70]); }
+    else if (kind === 'angry') { tone(160, 110, 0.2, 'sawtooth', 0.055); vib(60); }
+    else if (kind === 'pay') [523, 659, 784, 1047].forEach((f, i) => tone(f, 0, 0.16, 'triangle', 0.075, i * 0.09));
+    else if (kind === 'win') [523, 659, 784, 1047, 1319].forEach((f, i) => tone(f, 0, 0.22, 'triangle', 0.075, i * 0.11));
+    else if (kind === 'lose') [392, 330, 262, 196].forEach((f, i) => tone(f, 0, 0.25, 'triangle', 0.065, i * 0.13));
+  } catch (e) { }
+}
+addEventListener('pointerdown', () => { try { if (AC && AC.state === 'suspended') AC.resume(); } catch (e) { } }, true);
 
 /* ===== 12 ui shell ===== */
 const panels = [];
@@ -3953,6 +4007,16 @@ function updateHeader() {
     const v = nightView();
     $('#n-time').style.width = clamp(left / T_NIGHT * 100, 0, 100) + '%';
     if (v) { $('#n-sales').textContent = fmtY(v.R.sales, true); $('#n-served').textContent = v.R.served; $('#n-lost').textContent = v.R.lost; }
+    const gd = due(s), ng = $('#ngoal');
+    if (gd) {
+      const remain = gd.d.amt - s.money;
+      if (remain <= 0) ng.textContent = '次の返済OK！';
+      else {
+        let pv = priceOf(s, 'slime');
+        for (const m of MK) if ((s.meat[m] || 0) + (s.pat[m] || 0) > 0) pv = Math.max(pv, priceOf(s, m));
+        ng.textContent = gd.d.day + '日目の返済まで あと' + fmtY(remain) + '（バーガー約' + Math.ceil(remain / pv) + '個）';
+      }
+    } else ng.textContent = '';
   }
 }
 const PW = { key: '', gen: '' };
@@ -4187,7 +4251,14 @@ function startGame(mode) {
     if (ses !== net.ses) return;
     if (!net.snapReady) { setTimeout(intro, 400); return; }
     const s = st();
-    if (!s.over && s.day === 1 && s.di === 0 && store.get('kb_hi', '') !== (s.gen || 'x')) { store.set('kb_hi', s.gen || 'x'); showDebtInfo(); }
+    const hadBoot = app.bootStory; app.bootStory = 0;
+    if (!s.over && s.day === 1 && s.di === 0 && app.storyGen !== (s.gen || 'x')) {
+      // the opening prologue always plays when a game starts; if it just played at
+      // boot (first-ever launch), go straight to the debt briefing instead
+      app.storyGen = s.gen || 'x'; store.set('kb_hi', s.gen || 'x');
+      if (hadBoot) showDebtInfo();
+      else showStory(() => { if (app.started && st().day === 1) showDebtInfo(); });
+    }
     else bigMsg(s.day + '日目');
   };
   setTimeout(intro, 700);
@@ -4211,6 +4282,7 @@ function showMenu() {
       h('li', null, px('flame', 2), '焦げを放置すると火事'),
       h('li', null, px('thug', 1, COLLECTORS[0].pal), '期限までに借金を返す')),
     h('div', { class: 'btns' }, btn([px('i_scroll', 2), 'ストーリー'], () => { closeSheet(); showStory(() => { }); }), btn([px('i_coin', 2), '返済表'], () => { closeSheet(); showDebtInfo(); })),
+    btn((sfxMuted() ? '音と振動：オフ' : '音と振動：オン'), function () { const off = !sfxMuted(); store.set('kb_mute', off ? '1' : ''); this.replaceChildren(document.createTextNode(off ? '音と振動：オフ' : '音と振動：オン')); if (!off) sfx('coin'); }, 'ghost block'),
     h('div', { class: 'btns' }, reset, btn([px('i_door', 2), 'タイトルへ'], () => { closeSheet(); toTitle(); }, 'ghost')),
     btn('閉じる', () => closeSheet(), 'pri block')
   ]);
@@ -4249,7 +4321,7 @@ async function boot() {
   const first = store.get('kb_story', '') !== '1';
   const go = () => { store.set('kb_story', '1'); showTitle(); };
   const conn = connect().then(() => { banner(); introReady(); });
-  if (first) showStory(go); else showTitle();
+  if (first) { app.bootStory = 1; showStory(go); } else showTitle();
   await conn;
   setInterval(hostTick, 4000); setInterval(uiTick, 250);
   setInterval(() => { const n = performance.now(); if (document.hidden) hostAdvance(Math.min(1, (n - bgT) / 1000)); bgT = n; }, 500);
@@ -4260,7 +4332,7 @@ async function boot() {
     if (app.started) try { navigator.wakeLock && navigator.wakeLock.request('screen').catch(() => { }); } catch (e) { }
   });
   requestAnimationFrame(loop);
-  if (window.__KB_TEST) window.__kb = { st, live, S: () => S, isHost: () => isHost, app, net, D, P: () => P, startRun, endRun, sendCmd, applyCmd, hostTick, doAct, dayAct, RS, nightView, NV, bagCount, setPhaseLeft: v => { if (S) S.pl = v; }, begin, toTitle, peekSave, passCode, normPass, enterLobby, LB, startGame, tutNightStep, debtList, diffOf, npOf, DIFFS, initState, killsOf, killEnemy, genFloor };
+  if (window.__KB_TEST) window.__kb = { st, live, S: () => S, isHost: () => isHost, app, net, D, P: () => P, startRun, endRun, sendCmd, applyCmd, hostTick, doAct, dayAct, RS, nightView, NV, bagCount, setPhaseLeft: v => { if (S) S.pl = v; }, begin, toTitle, peekSave, passCode, normPass, enterLobby, LB, startGame, tutNightStep, debtList, diffOf, npOf, DIFFS, initState, killsOf, killEnemy, genFloor, MEATS, sfx, fameList };
 }
 boot();
 
